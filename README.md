@@ -98,3 +98,7 @@ python3 -m unittest discover -s tests
 ```
 
 `tests/test_core.py` covers the main workflows. The `tests/test_qa_*.py` files are the per-area acceptance suites (banking, ledger, invoices, reconciliation, reports).
+
+## License
+
+MIT. See [LICENSE](LICENSE). This is not financial, tax or payroll advice; check figures with an accountant.
