@@ -9,7 +9,8 @@
 # Environment: SQB_HOME (install folder), SQB_ZIP_URL (download location of the app's zip).
 set -e
 
-REPO_ZIP="${SQB_ZIP_URL:-https://github.com/andrewliang13/simplified_quickbooks/archive/refs/heads/main.zip}"
+REPO_ZIP="${SQB_ZIP_URL:-https://codeload.github.com/andrewliang13/simplified_quickbooks/zip/refs/heads/main}"
+REPO_ZIP_ALT="https://github.com/andrewliang13/simplified_quickbooks/archive/refs/heads/main.zip"
 DEST="${SQB_HOME:-$HOME/SimplifiedQuickBooks}"
 START=1
 TEST=0
@@ -45,7 +46,15 @@ say "Using $($PY --version 2>&1)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 say "Downloading Simplified QuickBooks..."
-curl -fsSL "$REPO_ZIP" -o "$TMP/app.zip"
+is_zip() { "$PY" -c 'import sys, zipfile; sys.exit(0 if zipfile.is_zipfile(sys.argv[1]) else 1)' "$1"; }
+curl -fsSL "$REPO_ZIP" -o "$TMP/app.zip" || true
+if ! is_zip "$TMP/app.zip"; then
+  curl -fsSL "$REPO_ZIP_ALT" -o "$TMP/app.zip" || true
+fi
+if ! is_zip "$TMP/app.zip"; then
+  say "Could not download the app. Check your internet connection and try again."
+  exit 1
+fi
 "$PY" -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$TMP/app.zip" "$TMP/x"
 SRC="$(find "$TMP/x" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 if [ ! -f "$SRC/run.py" ]; then

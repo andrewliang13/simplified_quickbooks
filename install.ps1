@@ -9,7 +9,8 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-$zipUrl = if ($env:SQB_ZIP_URL) { $env:SQB_ZIP_URL } else { 'https://github.com/andrewliang13/simplified_quickbooks/archive/refs/heads/main.zip' }
+$zipUrl = if ($env:SQB_ZIP_URL) { $env:SQB_ZIP_URL } else { 'https://codeload.github.com/andrewliang13/simplified_quickbooks/zip/refs/heads/main' }
+$zipAlt = 'https://github.com/andrewliang13/simplified_quickbooks/archive/refs/heads/main.zip'
 $dest = if ($env:SQB_HOME) { $env:SQB_HOME } else { Join-Path $HOME 'SimplifiedQuickBooks' }
 
 function Find-Python {
@@ -48,7 +49,10 @@ New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
     Write-Host 'Downloading Simplified QuickBooks...'
     $zip = Join-Path $tmp 'app.zip'
-    Invoke-WebRequest -UseBasicParsing -Uri $zipUrl -OutFile $zip
+    try { Invoke-WebRequest -UseBasicParsing -Uri $zipUrl -OutFile $zip } catch { }
+    $isZip = { param($f) (Test-Path $f) -and ([IO.File]::ReadAllBytes($f)[0..1] -join ',') -eq '80,75' }
+    if (-not (& $isZip $zip)) { Invoke-WebRequest -UseBasicParsing -Uri $zipAlt -OutFile $zip }
+    if (-not (& $isZip $zip)) { throw 'Could not download the app. Check your internet connection and try again.' }
     Expand-Archive -Path $zip -DestinationPath (Join-Path $tmp 'x') -Force
     $src = Get-ChildItem (Join-Path $tmp 'x') -Directory | Select-Object -First 1
     if (-not (Test-Path (Join-Path $src.FullName 'run.py'))) { throw 'The download did not contain the app (run.py missing).' }
