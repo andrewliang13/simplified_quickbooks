@@ -4,9 +4,27 @@ A small bookkeeping app that covers the everyday parts of QuickBooks: bank and c
 
 It runs on your own computer. Your books stay in one file on your disk; nothing is sent anywhere.
 
+## Install
+
+One line, then the app opens in your browser. It installs to `~/SimplifiedQuickBooks`, adds a Desktop shortcut, and updating later never touches your books.
+
+- **Mac / Linux** (Terminal):
+
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/andrewliang13/simplified_quickbooks/main/install.sh | bash
+  ```
+
+- **Windows** (PowerShell):
+
+  ```powershell
+  irm https://raw.githubusercontent.com/andrewliang13/simplified_quickbooks/main/install.ps1 | iex
+  ```
+
+Setting it up with an AI assistant? Give it this repository link and ask it to follow [AGENTS.md](AGENTS.md).
+
 ## Start it
 
-You need Python 3.9 or newer (macOS includes it; Windows: install from python.org). Nothing else is required.
+You need Python 3.9 or newer (macOS includes it; on Windows the installer offers to install it). Nothing else is required.
 
 - **Mac:** double-click `Start Simplified QuickBooks.command`. The first time, macOS may ask you to confirm: right-click the file, choose Open, then Open.
 - **Windows:** double-click `start_windows.bat`.
