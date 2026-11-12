@@ -108,16 +108,21 @@ def delete_txn(conn, txn_id):
     if not t:
         raise ApiError(404, 'Transaction not found')
     ensure_editable(conn, txn_id)
-    inv = conn.execute('SELECT id FROM invoices WHERE txn_id=?', (txn_id,)).fetchone()
-    if inv:
-        if conn.execute('SELECT 1 FROM payment_apps WHERE invoice_id=? LIMIT 1', (inv['id'],)).fetchone():
-            raise ApiError(409, 'This invoice has payments applied. Delete or un-apply the payments first.')
-        conn.execute('DELETE FROM invoice_lines WHERE invoice_id=?', (inv['id'],))
-        conn.execute('DELETE FROM invoices WHERE id=?', (inv['id'],))
-    pay = conn.execute('SELECT id FROM payments WHERE txn_id=?', (txn_id,)).fetchone()
-    if pay:
-        conn.execute('DELETE FROM payment_apps WHERE payment_id=?', (pay['id'],))
-        conn.execute('DELETE FROM payments WHERE id=?', (pay['id'],))
+    for doc, lines, fk, apps, label in (('invoices', 'invoice_lines', 'invoice_id', 'payment_apps', 'invoice'),
+                                        ('bills', 'bill_lines', 'bill_id', 'bill_payment_apps', 'bill')):
+        d = conn.execute('SELECT id FROM %s WHERE txn_id=?' % doc, (txn_id,)).fetchone()
+        if d:
+            if conn.execute('SELECT 1 FROM %s WHERE %s=? LIMIT 1' % (apps, fk), (d['id'],)).fetchone():
+                raise ApiError(409, 'This %s has payments applied. Delete or un-apply the payments first.' % label)
+            conn.execute('DELETE FROM %s WHERE %s=?' % (lines, fk), (d['id'],))
+            conn.execute('DELETE FROM %s WHERE id=?' % doc, (d['id'],))
+    for pay, apps in (('payments', 'payment_apps'), ('bill_payments', 'bill_payment_apps')):
+        p = conn.execute('SELECT id FROM %s WHERE txn_id=?' % pay, (txn_id,)).fetchone()
+        if p:
+            conn.execute('DELETE FROM %s WHERE payment_id=?' % apps, (p['id'],))
+            conn.execute('DELETE FROM %s WHERE id=?' % pay, (p['id'],))
+    conn.execute('DELETE FROM paychecks WHERE txn_id=?', (txn_id,))
+    conn.execute('DELETE FROM inv_moves WHERE txn_id=?', (txn_id,))
     conn.execute("UPDATE feed SET status='review', line_id=NULL, created_txn=0 "
                  'WHERE line_id IN (SELECT id FROM lines WHERE txn_id=?)', (txn_id,))
     conn.execute('DELETE FROM lines WHERE txn_id=?', (txn_id,))
@@ -133,8 +138,9 @@ def txn_json(conn, txn_id):
         'SELECT l.*, a.name AS account, a.type AS account_type, n.name AS name, n.kind AS name_kind '
         'FROM lines l JOIN accounts a ON a.id = l.account_id '
         'LEFT JOIN names n ON n.id = l.name_id WHERE l.txn_id=? ORDER BY l.seq, l.id', (txn_id,)).fetchall()
-    inv = conn.execute('SELECT id FROM invoices WHERE txn_id=?', (txn_id,)).fetchone()
-    pay = conn.execute('SELECT id FROM payments WHERE txn_id=?', (txn_id,)).fetchone()
+    one = lambda table: conn.execute('SELECT id FROM %s WHERE txn_id=?' % table, (txn_id,)).fetchone()  # noqa: E731
+    inv, pay = one('invoices'), one('payments')
+    bill, bpay, chk = one('bills'), one('bill_payments'), one('paychecks')
     from_feed = conn.execute(
         'SELECT f.id FROM feed f JOIN lines l ON l.id=f.line_id WHERE l.txn_id=? AND f.created_txn=1',
         (txn_id,)).fetchone()
@@ -145,6 +151,9 @@ def txn_json(conn, txn_id):
         'reconciled': any(r['recon_status'] == 'R' for r in rows),
         'invoice_id': inv['id'] if inv else None,
         'payment_id': pay['id'] if pay else None,
+        'bill_id': bill['id'] if bill else None,
+        'bill_payment_id': bpay['id'] if bpay else None,
+        'paycheck_id': chk['id'] if chk else None,
         'feed_id': from_feed['id'] if from_feed else None,
         'lines': [{
             'id': r['id'], 'account_id': r['account_id'], 'account': r['account'],

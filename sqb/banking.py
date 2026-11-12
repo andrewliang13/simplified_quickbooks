@@ -34,6 +34,21 @@ def _norm(desc):
 def _parse_payload(ctx):
     b = ctx.body
     acct = _feed_account(ctx.conn, b.get('account_id'))
+    if b.get('rows') is not None:
+        # Rows the user reviewed (and possibly corrected) in the import preview.
+        from .util import parse_date
+        rows = []
+        for i, r in enumerate(as_list(b['rows'], 'rows', dict), 1):
+            amt = to_cents(r.get('amount'), 'row %d amount' % i)
+            if not amt:
+                continue
+            rows.append({'date': parse_date(r.get('date'), 'row %d date' % i),
+                         'description': as_str(r.get('description'), 'description')[:300], 'amount': amt,
+                         'fitid': as_str(r.get('fitid'), 'fitid') or None})
+        if not rows:
+            raise ApiError(400, 'There are no rows to import')
+        meta = {'format': as_str(b.get('format'), 'format') or 'reviewed', 'warnings': []}
+        return acct, _dedupe(ctx.conn, acct, rows), meta
     if b.get('content_b64'):
         try:
             data = base64.b64decode(as_str(b['content_b64'], 'content_b64'))
@@ -50,10 +65,14 @@ def _parse_payload(ctx):
     if b.get('flip_sign'):
         for r in rows:
             r['amount'] = -r['amount']
+    return acct, _dedupe(ctx.conn, acct, rows), meta
+
+
+def _dedupe(conn, acct, rows):
     # A row is a duplicate when the bank's own id (FITID) was imported before, or when the same
     # date + amount + description was (the n-th identical row of a day only matches the n-th).
     existing, fitids = set(), set()
-    for k, f in ctx.conn.execute('SELECT key, fitid FROM feed WHERE account_id=?', (acct['id'],)):
+    for k, f in conn.execute('SELECT key, fitid FROM feed WHERE account_id=?', (acct['id'],)):
         existing.add(k)
         if f:
             fitids.add(f)
@@ -64,7 +83,7 @@ def _parse_payload(ctx):
         seen[base] = n + 1
         r['key'] = 'H:' + hashlib.sha1(('%s|%d' % (base, n)).encode('utf-8')).hexdigest()
         r['duplicate'] = r['key'] in existing or bool(r.get('fitid') and r['fitid'] in fitids)
-    return acct, rows, meta
+    return rows
 
 
 def _preview_json(acct, rows, meta):
@@ -77,7 +96,7 @@ def _preview_json(acct, rows, meta):
         'start': min((r['date'] for r in rows), default=None),
         'end': max((r['date'] for r in rows), default=None),
         'rows': [{'date': r['date'], 'description': r['description'], 'amount': money(r['amount']),
-                  'duplicate': r['duplicate']} for r in rows],
+                  'duplicate': r['duplicate'], 'fitid': r.get('fitid')} for r in rows],
     }
 
 
@@ -113,8 +132,8 @@ def _history(conn):
         'FROM feed f JOIN lines l ON l.id = f.line_id JOIN transactions t ON t.id = l.txn_id '
         'JOIN lines l2 ON l2.txn_id = t.id AND l2.id <> l.id '
         'JOIN accounts a2 ON a2.id = l2.account_id '
-        "WHERE f.status='posted' AND f.created_txn=1 AND t.type <> 'Payment' "
-        "AND a2.type <> 'Accounts Receivable' AND a2.system IS NOT 'udf' ORDER BY t.id").fetchall()
+        "WHERE f.status='posted' AND f.created_txn=1 AND t.type NOT IN ('Payment', 'Bill Payment') "
+        "AND a2.type NOT IN ('Accounts Receivable', 'Accounts Payable') AND a2.system IS NOT 'udf' ORDER BY t.id").fetchall()
     hist = {}
     for r in rows:
         if r['n'] == 2 and _norm(r['description']):
@@ -150,9 +169,11 @@ def _matches(conn, row, acct_type):
     for l in lines:
         out.append({'kind': 'transaction', 'line_id': l['id'], 'txn_id': l['txn_id'], 'date': l['date'],
                     'label': ' '.join(x for x in (l['type'], l['ref'] and '#' + l['ref'], l['name'], l['memo']) if x)})
+    out += _bill_matches(conn, row)
     if acct_type == 'Bank' and row['amount'] > 0:
         for inv in invoices.open_invoices(conn):
-            if inv['balance_cents'] == row['amount'] and inv['date'] <= row['date']:
+            if inv['balance_cents'] == row['amount'] and inv['date'] <= row['date'] and \
+                    inv['currency'] == inv_home(conn):
                 out.append({'kind': 'invoice', 'invoice_id': inv['id'], 'date': inv['date'],
                             'label': 'Invoice #%s %s (open %.2f)' % (inv['number'], inv['customer'],
                                                                       inv['balance_cents'] / 100.0)})
@@ -167,6 +188,21 @@ def _matches(conn, row, acct_type):
             out.append({'kind': 'undeposited', 'date': pays[0]['date'] if pays else row['date'],
                         'label': 'Deposit of Undeposited Funds (%s)' % who})
     return out
+
+
+def inv_home(conn):
+    from .documents import home_currency
+    return home_currency(conn)
+
+
+def _bill_matches(conn, row):
+    if row['amount'] >= 0:
+        return []
+    return [{'kind': 'bill', 'bill_id': b['id'], 'date': b['date'],
+             'label': 'Bill %s%s (open %.2f)' % ('#%s ' % b['number'] if b['number'] else '', b['vendor'],
+                                                 b['balance_cents'] / 100.0)}
+            for b in invoices.open_bills(conn)
+            if b['balance_cents'] == -row['amount'] and b['date'] <= row['date'] and b['currency'] == inv_home(conn)]
 
 
 def _posted_info(conn, row):
@@ -225,6 +261,88 @@ def feed_summary(ctx):
 
 # ---------------------------------------------------------------- categorize / match / exclude / undo
 
+def _txn_type(acct, cats, money_in):
+    if len(cats) == 1 and cats[0]['type'] in ('Bank', 'Credit Card'):
+        return 'Credit Card Payment' if 'Credit Card' in (cats[0]['type'], acct['type']) and \
+            cats[0]['type'] != acct['type'] else 'Transfer'
+    if money_in:
+        return 'Deposit' if acct['type'] == 'Bank' else 'Credit Card Credit'
+    return 'Expense'
+
+
+def _check_category(conn, acct, account_id):
+    c = conn.execute('SELECT * FROM accounts WHERE id=?', (account_id,)).fetchone()
+    if not c:
+        raise ApiError(400, 'Choose a category')
+    if c['id'] == acct['id']:
+        raise ApiError(400, 'The category cannot be the same account as the bank or card')
+    if c['type'] in ('Accounts Receivable', 'Accounts Payable'):
+        raise ApiError(400, 'Use Receive Payment or Pay Bills for customer and vendor payments')
+    return c
+
+
+EDITABLE_TYPES = ('Expense', 'Deposit', 'Credit Card Credit', 'Transfer', 'Credit Card Payment')
+
+
+@route('PUT', '/api/transactions/<id>/categories')
+def edit_categories(ctx):
+    """Change the category (or split), payee, memo and date of a bank or card transaction. The bank/card side
+    and its amount stay as they are, so this works even after the transaction has been reconciled."""
+    conn, b = ctx.conn, ctx.body
+    t = conn.execute('SELECT * FROM transactions WHERE id=?', (ctx.p['id'],)).fetchone()
+    if not t:
+        raise ApiError(404, 'Transaction not found')
+    if t['type'] not in EDITABLE_TYPES:
+        raise ApiError(400, 'Edit this %s from its own screen' % t['type'].lower())
+    lines = conn.execute('SELECT l.*, a.type AS atype FROM lines l JOIN accounts a ON a.id = l.account_id '
+                         'WHERE l.txn_id=? ORDER BY l.seq, l.id', (t['id'],)).fetchall()
+    linked = conn.execute('SELECT l.id FROM feed f JOIN lines l ON l.id = f.line_id WHERE l.txn_id=?',
+                          (t['id'],)).fetchone()
+    anchor = next((l for l in lines if linked and l['id'] == linked['id']), None) or \
+        next((l for l in lines if l['atype'] in ('Bank', 'Credit Card')), None)
+    if not anchor:
+        raise ApiError(400, 'This transaction has no bank or card side')
+    others = [l for l in lines if l['id'] != anchor['id']]
+    if any(l['recon_status'] for l in others):
+        raise ApiError(409, 'The other side of this transfer is reconciled. Undo that reconciliation first.')
+    acct = conn.execute('SELECT * FROM accounts WHERE id=?', (anchor['account_id'],)).fetchone()
+    net = anchor['debit'] - anchor['credit']
+    money_in, total = net > 0, abs(net)
+    splits = []
+    for s in as_list(b.get('splits'), 'splits', dict):
+        amt = to_cents(s.get('amount'), 'split amount')
+        if amt:
+            splits.append({'account_id': as_int(s.get('account_id'), 'category'), 'amount': amt,
+                           'memo': as_str(s.get('memo'), 'memo')})
+    if not splits:
+        raise ApiError(400, 'Choose a category')
+    if sum(s['amount'] for s in splits) != total:
+        raise ApiError(400, 'Split amounts (%.2f) must add up to the transaction amount (%.2f)'
+                       % (sum(s['amount'] for s in splits) / 100.0, total / 100.0))
+    cats = [_check_category(conn, acct, s['account_id']) for s in splits]
+    name_id = as_int(b.get('name_id'), 'name', required=False) if 'name_id' in b else t['name_id']
+    if name_id and not conn.execute('SELECT 1 FROM names WHERE id=?', (name_id,)).fetchone():
+        raise ApiError(400, 'Unknown customer/vendor')
+    from .util import parse_date
+    date = parse_date(b['date']) if b.get('date') else t['date']
+    if date != t['date'] and anchor['recon_status'] == 'R':
+        raise ApiError(409, 'The date of a reconciled transaction cannot change')
+    memo = as_str(b['memo'], 'memo') if 'memo' in b else t['memo']
+    conn.execute('DELETE FROM lines WHERE txn_id=? AND id<>?', (t['id'], anchor['id']))
+    for i, s in enumerate(splits, 1):
+        conn.execute('INSERT INTO lines(txn_id, seq, account_id, debit, credit, memo, name_id) VALUES (?,?,?,?,?,?,?)',
+                     (t['id'], i, s['account_id'], 0 if money_in else s['amount'], s['amount'] if money_in else 0,
+                      s['memo'] or anchor['memo'], None))
+    conn.execute('UPDATE transactions SET date=?, memo=?, name_id=?, type=? WHERE id=?',
+                 (date, memo, name_id, _txn_type(acct, cats, money_in), t['id']))
+    if date != t['date'] and anchor['recon_status'] == 'C':
+        rec = conn.execute('SELECT statement_date FROM reconciliations WHERE id=?',
+                           (anchor['reconciliation_id'],)).fetchone()
+        if rec and date > rec['statement_date']:
+            conn.execute("UPDATE lines SET recon_status='', reconciliation_id=NULL WHERE id=?", (anchor['id'],))
+    return ledger.txn_json(conn, t['id'])
+
+
 def categorize(conn, row, splits, name_id=None, memo=''):
     """Post a statement line to the ledger. splits: [{'account_id', 'amount' (cents), 'memo'}];
     split amounts are in the direction of the statement line and must add up to it."""
@@ -249,13 +367,7 @@ def categorize(conn, row, splits, name_id=None, memo=''):
             raise ApiError(400, 'To record a customer payment, match the deposit to an invoice '
                                 'or use Receive Payment')
         cats.append(c)
-    if len(cats) == 1 and cats[0]['type'] in ('Bank', 'Credit Card'):
-        ttype = 'Credit Card Payment' if 'Credit Card' in (cats[0]['type'], acct['type']) and \
-            cats[0]['type'] != acct['type'] else 'Transfer'
-    elif money_in:
-        ttype = 'Deposit' if acct['type'] == 'Bank' else 'Credit Card Credit'
-    else:
-        ttype = 'Expense'
+    ttype = _txn_type(acct, cats, money_in)
     bank_line = {'account_id': acct['id'], 'memo': row['description'],
                  'debit' if money_in else 'credit': total}
     lines = [bank_line]
@@ -323,6 +435,23 @@ def match_one(ctx):
         if ledger.account_net(conn, udf, end=row['date']) < row['amount']:
             raise ApiError(400, 'The deposit is larger than the amount held in Undeposited Funds')
         tid = categorize(conn, row, [{'account_id': udf, 'amount': row['amount']}], memo='Bank deposit')
+        return ledger.txn_json(conn, tid)
+    if ctx.body.get('bill_id'):
+        if row['amount'] >= 0:
+            raise ApiError(400, 'Only withdrawals or charges can be matched to bills')
+        bill = invoices.docs.get_doc(conn, invoices.PURCHASE, as_int(ctx.body['bill_id'], 'bill_id'))
+        if bill['currency'] != inv_home(conn):
+            raise ApiError(400, 'Foreign-currency bills are paid with Pay Bills')
+        if bill['balance_cents'] < -row['amount']:
+            raise ApiError(400, 'The payment is larger than the open balance of this bill')
+        pid = invoices.save_bill_payment(conn, {
+            'vendor_id': bill['vendor_id'], 'date': row['date'], 'amount_cents': -row['amount'],
+            'pay_account_id': row['account_id'], 'memo': row['description'],
+            'applications': [{'bill_id': bill['id'], 'amount_cents': -row['amount']}]})
+        tid = conn.execute('SELECT txn_id FROM bill_payments WHERE id=?', (pid,)).fetchone()[0]
+        line = conn.execute('SELECT id FROM lines WHERE txn_id=? AND account_id=?', (tid, row['account_id'])).fetchone()
+        conn.execute("UPDATE feed SET status='posted', line_id=?, created_txn=1 WHERE id=?", (line['id'], row['id']))
+        reconcile.auto_clear(conn, line['id'], row['date'])
         return ledger.txn_json(conn, tid)
     if ctx.body.get('invoice_id'):
         if acct['type'] != 'Bank':

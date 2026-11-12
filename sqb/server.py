@@ -15,7 +15,7 @@ from . import backup, db
 from .router import ROUTES, Ctx
 from .util import ApiError
 # Importing the modules registers their routes.
-from . import accounts, names, journals, banking, invoices, reconcile, reports  # noqa: F401,E402
+from . import accounts, names, journals, banking, invoices, items, payroll, reconcile, reports  # noqa: F401,E402
 
 STATIC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'static')
 

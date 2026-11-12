@@ -289,15 +289,12 @@ def pdf_to_text(data):
             return '\n'.join((p.extract_text() or '') for p in pdf.pages)
     except ImportError:
         pass
-    try:
-        try:
-            from pypdf import PdfReader
-        except ImportError:
-            from PyPDF2 import PdfReader
-        return '\n'.join((p.extract_text() or '') for p in PdfReader(io.BytesIO(data)).pages)
-    except ImportError:
-        raise ApiError(400, 'PDF import needs an extra package. Run "pip3 install pdfplumber" and restart, '
-                            'or download the statement from your bank as CSV or QFX/OFX instead.')
+    from . import pdftext       # built in: no extra package needed
+    text = pdftext.extract_text(data)
+    if not text.strip():
+        raise ApiError(400, 'This PDF has no readable text (it may be a scanned image). '
+                            'Download the statement as CSV or QFX/OFX instead.')
+    return text
 
 
 def parse_statement(data, filename='', is_cc=False, year=None):
@@ -308,7 +305,8 @@ def parse_statement(data, filename='', is_cc=False, year=None):
         if not rows:
             raise ApiError(400, 'No transactions could be read from this PDF. Try a CSV or QFX/OFX download.')
         return rows, {'format': 'pdf', 'warnings': [
-            'PDF import is best-effort. Check the dates, amounts and signs below before importing.']}
+            'PDF statements are read from the page layout. Check each row below; you can fix a date, '
+            'description or amount, flip a sign, or remove a row before importing.']}
     try:
         if data[:2] in (b'\xff\xfe', b'\xfe\xff'):
             text = data.decode('utf-16')          # Excel "Unicode Text"

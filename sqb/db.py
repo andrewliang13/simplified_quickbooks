@@ -127,6 +127,128 @@ CREATE TABLE IF NOT EXISTS payment_apps(
   amount INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS items(
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  sku TEXT NOT NULL DEFAULT '',
+  type TEXT NOT NULL DEFAULT 'service',   -- service | non_inventory | inventory
+  description TEXT NOT NULL DEFAULT '',
+  sales_price INTEGER NOT NULL DEFAULT 0, -- cents
+  purchase_cost INTEGER NOT NULL DEFAULT 0,
+  income_account_id INTEGER,
+  expense_account_id INTEGER,             -- expense, or Cost of Goods Sold for inventory
+  asset_account_id INTEGER,               -- inventory only
+  taxable INTEGER NOT NULL DEFAULT 0,
+  active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS inv_moves(     -- inventory quantity and value changes (home currency cents)
+  id INTEGER PRIMARY KEY,
+  item_id INTEGER NOT NULL,
+  txn_id INTEGER NOT NULL,
+  date TEXT NOT NULL,
+  qty REAL NOT NULL,
+  value INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_moves_item ON inv_moves(item_id);
+
+CREATE TABLE IF NOT EXISTS tax_rates(
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  rate TEXT NOT NULL,                     -- percent, e.g. '8.25'
+  agency TEXT NOT NULL DEFAULT '',
+  active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS bills(
+  id INTEGER PRIMARY KEY,
+  txn_id INTEGER NOT NULL,
+  vendor_id INTEGER NOT NULL,
+  number TEXT NOT NULL DEFAULT '',
+  date TEXT NOT NULL,
+  due_date TEXT NOT NULL,
+  terms TEXT NOT NULL DEFAULT '',
+  memo TEXT NOT NULL DEFAULT '',
+  total INTEGER NOT NULL DEFAULT 0,       -- document currency cents
+  total_home INTEGER NOT NULL DEFAULT 0,
+  currency TEXT NOT NULL DEFAULT '',
+  exchange_rate TEXT NOT NULL DEFAULT '1',
+  tax_rate_id INTEGER,
+  tax INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS bill_lines(
+  id INTEGER PRIMARY KEY,
+  bill_id INTEGER NOT NULL,
+  seq INTEGER NOT NULL DEFAULT 0,
+  description TEXT NOT NULL DEFAULT '',
+  qty REAL NOT NULL DEFAULT 1,
+  rate REAL NOT NULL DEFAULT 0,
+  amount INTEGER NOT NULL DEFAULT 0,
+  account_id INTEGER NOT NULL,
+  item_id INTEGER,
+  taxable INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS bill_payments(
+  id INTEGER PRIMARY KEY,
+  txn_id INTEGER NOT NULL,
+  vendor_id INTEGER NOT NULL,
+  date TEXT NOT NULL,
+  amount INTEGER NOT NULL,
+  pay_account_id INTEGER NOT NULL,
+  method TEXT NOT NULL DEFAULT '',
+  ref TEXT NOT NULL DEFAULT '',
+  memo TEXT NOT NULL DEFAULT '',
+  exchange_rate TEXT NOT NULL DEFAULT '1',
+  ctrl_home INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS bill_payment_apps(
+  id INTEGER PRIMARY KEY,
+  payment_id INTEGER NOT NULL,
+  bill_id INTEGER NOT NULL,
+  amount INTEGER NOT NULL,
+  home INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS employees(
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  email TEXT NOT NULL DEFAULT '',
+  phone TEXT NOT NULL DEFAULT '',
+  address TEXT NOT NULL DEFAULT '',
+  pay_type TEXT NOT NULL DEFAULT 'hourly',  -- hourly | salary
+  pay_rate INTEGER NOT NULL DEFAULT 0,      -- cents per hour, or per paycheck for salary
+  fed_pct TEXT NOT NULL DEFAULT '0',        -- federal income tax withholding, % of gross
+  state_pct TEXT NOT NULL DEFAULT '0',
+  active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS paychecks(
+  id INTEGER PRIMARY KEY,
+  txn_id INTEGER NOT NULL,
+  employee_id INTEGER NOT NULL,
+  pay_date TEXT NOT NULL,
+  period_start TEXT NOT NULL DEFAULT '',
+  period_end TEXT NOT NULL DEFAULT '',
+  hours REAL NOT NULL DEFAULT 0,
+  gross INTEGER NOT NULL DEFAULT 0,
+  fed_wh INTEGER NOT NULL DEFAULT 0,
+  state_wh INTEGER NOT NULL DEFAULT 0,
+  ss_ee INTEGER NOT NULL DEFAULT 0,
+  med_ee INTEGER NOT NULL DEFAULT 0,
+  other_ded INTEGER NOT NULL DEFAULT 0,
+  ss_er INTEGER NOT NULL DEFAULT 0,
+  med_er INTEGER NOT NULL DEFAULT 0,
+  futa INTEGER NOT NULL DEFAULT 0,
+  suta INTEGER NOT NULL DEFAULT 0,
+  net INTEGER NOT NULL DEFAULT 0,
+  bank_account_id INTEGER NOT NULL,
+  check_no TEXT NOT NULL DEFAULT '',
+  memo TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS reconciliations(
   id INTEGER PRIMARY KEY,
   account_id INTEGER NOT NULL,
@@ -147,12 +269,13 @@ DEFAULT_ACCOUNTS = [
     ('1200', 'Accounts Receivable', 'Accounts Receivable', 'ar'),
     ('1250', 'Undeposited Funds', 'Other Current Asset', 'udf'),
     ('1300', 'Prepaid Expenses', 'Other Current Asset', None),
+    ('1350', 'Inventory Asset', 'Other Current Asset', 'inv'),
     ('1500', 'Furniture and Equipment', 'Fixed Asset', None),
     ('1590', 'Accumulated Depreciation', 'Fixed Asset', None),
     ('2000', 'Accounts Payable', 'Accounts Payable', 'ap'),
     ('2100', 'Credit Card', 'Credit Card', None),
-    ('2200', 'Payroll Liabilities', 'Other Current Liability', None),
-    ('2300', 'Sales Tax Payable', 'Other Current Liability', None),
+    ('2200', 'Payroll Liabilities', 'Other Current Liability', 'pl'),
+    ('2300', 'Sales Tax Payable', 'Other Current Liability', 'tax'),
     ('2500', 'Notes Payable', 'Long Term Liability', None),
     ('3000', 'Opening Balance Equity', 'Equity', 'obe'),
     ('3100', "Owner's Investment", 'Equity', None),
@@ -169,6 +292,7 @@ DEFAULT_ACCOUNTS = [
     ('6040', 'Meals and Entertainment', 'Expense', None),
     ('6050', 'Office Supplies and Software', 'Expense', None),
     ('6060', 'Payroll Expenses', 'Expense', None),
+    ('6065', 'Payroll Tax Expense', 'Expense', 'ptx'),
     ('6070', 'Rent and Lease', 'Expense', None),
     ('6080', 'Repairs and Maintenance', 'Expense', None),
     ('6090', 'Taxes and Licenses', 'Expense', None),
@@ -178,7 +302,27 @@ DEFAULT_ACCOUNTS = [
     ('6900', 'Uncategorized Expense', 'Expense', None),
     ('7000', 'Interest Income', 'Other Income', None),
     ('8000', 'Interest Expense', 'Other Expense', None),
+    ('8100', 'Exchange Gain or Loss', 'Other Expense', 'fx'),
 ]
+
+# Accounts the app posts to automatically: (code, number, name, type). Added to older company files.
+SYSTEM_ACCOUNTS = [('ap', '2000', 'Accounts Payable', 'Accounts Payable'),
+                   ('inv', '1350', 'Inventory Asset', 'Other Current Asset'),
+                   ('pl', '2200', 'Payroll Liabilities', 'Other Current Liability'),
+                   ('tax', '2300', 'Sales Tax Payable', 'Other Current Liability'),
+                   ('ptx', '6065', 'Payroll Tax Expense', 'Expense'),
+                   ('fx', '8100', 'Exchange Gain or Loss', 'Other Expense')]
+
+# Columns added after the first release: (table, column, declaration)
+COLUMNS = [('feed', 'fitid', 'TEXT'), ('reconciliations', 'snapshot', 'TEXT'),
+           ('names', 'currency', "TEXT NOT NULL DEFAULT ''"),
+           ('invoices', 'currency', "TEXT NOT NULL DEFAULT ''"),
+           ('invoices', 'exchange_rate', "TEXT NOT NULL DEFAULT '1'"),
+           ('invoices', 'total_home', 'INTEGER'),
+           ('invoices', 'tax_rate_id', 'INTEGER'), ('invoices', 'tax', 'INTEGER NOT NULL DEFAULT 0'),
+           ('invoice_lines', 'item_id', 'INTEGER'), ('invoice_lines', 'taxable', 'INTEGER NOT NULL DEFAULT 0'),
+           ('payments', 'exchange_rate', "TEXT NOT NULL DEFAULT '1'"), ('payments', 'ctrl_home', 'INTEGER'),
+           ('payment_apps', 'home', 'INTEGER')]
 
 
 def connect(path):
@@ -191,21 +335,46 @@ def init(path):
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
-        if 'fitid' not in [r[1] for r in conn.execute('PRAGMA table_info(feed)')]:
-            conn.execute('ALTER TABLE feed ADD COLUMN fitid TEXT')
-        if 'snapshot' not in [r[1] for r in conn.execute('PRAGMA table_info(reconciliations)')]:
-            conn.execute('ALTER TABLE reconciliations ADD COLUMN snapshot TEXT')
+        for table, col, decl in COLUMNS:
+            if col not in [r[1] for r in conn.execute('PRAGMA table_info(%s)' % table)]:
+                conn.execute('ALTER TABLE %s ADD COLUMN %s %s' % (table, col, decl))
+        # Home-currency amounts for documents written before multi-currency existed.
+        conn.execute('UPDATE invoices SET total_home = total WHERE total_home IS NULL')
+        conn.execute('UPDATE payment_apps SET home = amount WHERE home IS NULL')
+        conn.execute('UPDATE payments SET ctrl_home = amount WHERE ctrl_home IS NULL')
         if conn.execute('SELECT COUNT(*) FROM accounts').fetchone()[0] == 0:
             conn.executemany(
                 'INSERT INTO accounts(number, name, type, system) VALUES (?,?,?,?)', DEFAULT_ACCOUNTS)
             conn.executemany('INSERT OR IGNORE INTO settings(key, value) VALUES (?,?)',
                              [('company_name', 'My Company'), ('fiscal_year_start_month', '1')])
+        for code, number, name, atype in SYSTEM_ACCOUNTS:
+            if conn.execute('SELECT 1 FROM accounts WHERE system=?', (code,)).fetchone():
+                continue
+            hit = conn.execute('SELECT id FROM accounts WHERE name=? COLLATE NOCASE AND type=? AND system IS NULL',
+                               (name, atype)).fetchone()
+            if hit:
+                conn.execute('UPDATE accounts SET system=? WHERE id=?', (code, hit[0]))
+            else:
+                taken = conn.execute('SELECT 1 FROM accounts WHERE number=?', (number,)).fetchone()
+                n = 2
+                while conn.execute('SELECT 1 FROM accounts WHERE name=? COLLATE NOCASE',
+                                   (name if n == 2 else '%s %d' % (name, n - 1),)).fetchone():
+                    n += 1
+                conn.execute('INSERT INTO accounts(number, name, type, system) VALUES (?,?,?,?)',
+                             ('' if taken else number, name if n == 2 else '%s %d' % (name, n - 1), atype, code))
         conn.commit()
     finally:
         conn.close()
 
 
+DEFAULTS = {'home_currency': 'USD', 'ss_rate': '6.2', 'ss_wage_base': '184500', 'medicare_rate': '1.45',
+            'addl_medicare_rate': '0.9', 'addl_medicare_threshold': '200000', 'futa_rate': '0.6',
+            'futa_wage_base': '7000', 'suta_rate': '2.7', 'suta_wage_base': '7000'}
+
+
 def get_setting(conn, key, default=None):
+    if default is None:
+        default = DEFAULTS.get(key)
     r = conn.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
     return r[0] if r else default
 

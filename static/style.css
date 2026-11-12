@@ -132,10 +132,40 @@ tr.grandsum td { font-weight: 700; border-top: 1px solid var(--ink); border-bott
   #side, .head button, .bar, .tabs, #toast, .noprint { display: none !important; }
   body { background: #fff; } main { padding: 0; } .report { border: 0; padding: 0; }
 }
-@media (max-width: 900px) {
-  #side { width: 64px; } #side .brand span:last-child, #settings-btn { display: none; }
-  #nav a { padding: 10px 8px; font-size: 11px; text-align: center; }
-  .recon-sum { grid-template-columns: repeat(2, 1fr); } .form, .form.three, .form.four { grid-template-columns: 1fr; }
+/* Tablet and phone: navigation becomes a scrolling top bar and list tables become stacked cards,
+   so nothing needs sideways scrolling. Financial reports keep their columns. */
+@media (max-width: 1024px) {
+  body { flex-direction: column; }
+  #side { width: 100%; height: auto; position: sticky; top: 0; z-index: 40; flex-direction: row; align-items: center; }
+  #side .brand { padding: 10px 12px; }
+  #side .brand span:last-child { display: none; }
+  #nav { flex-direction: row; overflow-x: auto; white-space: nowrap; scrollbar-width: none; }
+  #nav a { border-left: 0; border-bottom: 3px solid transparent; padding: 14px 10px 11px; font-size: 13px; }
+  #nav a.active { border-bottom-color: var(--green); }
+  #settings-btn { padding: 10px 12px; white-space: nowrap; font-size: 13px; }
+  main { padding: 16px 16px 48px; }
+  .head h1 { font-size: 20px; flex-basis: 100%; }
+  .recon-sum { grid-template-columns: repeat(2, 1fr); }
+  .form.three, .form.four { grid-template-columns: repeat(2, 1fr); }
+  .modal-backdrop { padding: 12px; }
+  .tbl table:not(.lines) thead { display: none; }
+  .tbl table:not(.lines) tr { display: block; border-bottom: 1px solid var(--line); padding: 6px 0; }
+  .tbl table:not(.lines) td { display: flex; justify-content: space-between; align-items: center; gap: 12px;
+    border: 0; padding: 4px 12px; text-align: right; }
+  .tbl table:not(.lines) td::before { content: attr(data-label); color: var(--muted); font-size: 12px; text-align: left;
+    flex-shrink: 0; text-transform: uppercase; letter-spacing: .03em; }
+  .tbl table:not(.lines) td:not([data-label])::before, .tbl table:not(.lines) td[data-label=""]::before { content: none; }
+  .tbl table:not(.lines) td.actions { justify-content: flex-end; flex-wrap: wrap; gap: 4px; }
+  .tbl table:not(.lines) td.empty { display: block; text-align: center; }
+  .tbl table:not(.lines) tr.grp td, .tbl table:not(.lines) tr.sum td { justify-content: flex-start; }
+  td select.cat, td select.payee { width: 60vw; max-width: 320px; }
+  td.desc { min-width: 0; }
+}
+@media (max-width: 600px) {
+  .form, .form.three, .form.four { grid-template-columns: 1fr; }
+  .form .full, .form [style*="grid-column"] { grid-column: auto !important; }
+  .cards { grid-template-columns: 1fr 1fr; }
+  .recon-sum { grid-template-columns: 1fr; }
 }
 
 /* banking table: keep the action buttons on screen */

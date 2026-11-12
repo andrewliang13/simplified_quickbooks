@@ -472,3 +472,27 @@ class Backups(ApiCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class EditCategory(ApiCase):
+    def test_recategorize_after_reconcile(self):
+        chk = self.acct('Checking')
+        self.post('/api/feed/import', {'account_id': chk, 'content': 'Date,Description,Amount\n01/05/2026,STAPLES,-100.00\n'})
+        row = self.get('/api/feed', account_id=chk)['rows'][0]
+        t = self.post('/api/feed/%d/categorize' % row['id'], {'account_id': self.acct('Travel')})
+        rec = self.post('/api/reconciliations', {'account_id': chk, 'statement_date': '2026-01-31', 'ending_balance': -100})
+        self.post('/api/reconciliations/%d/finish' % rec['id'])
+        v = self.put('/api/transactions/%d/categories' % t['id'], {'splits': [
+            {'account_id': self.acct('Office Supplies and Software'), 'amount': 70},
+            {'account_id': self.acct('Meals and Entertainment'), 'amount': 30}], 'memo': 'fixed'})
+        self.assertEqual((v['memo'], v['reconciled'], len(v['lines'])), ('fixed', True, 3))
+        pl = self.get('/api/reports/profit_loss', start='2026-01-01', end='2026-01-31')
+        self.assertEqual(self.val(pl, 'Office Supplies and Software'), 70.0)
+        with self.assertRaises(KeyError):
+            self.row(pl, 'Travel')
+        self.put('/api/transactions/%d/categories' % t['id'], {'splits': [
+            {'account_id': self.acct('Travel'), 'amount': 99}]}, expect=400)          # must add up
+        self.put('/api/transactions/%d/categories' % t['id'], {'date': '2026-02-01', 'splits': [
+            {'account_id': self.acct('Travel'), 'amount': 100}]}, expect=409)         # reconciled date locked
+        self.assertEqual(self.get('/api/feed', account_id=chk, status='posted')['rows'][0]['category'], 'Office Supplies and Software'
+                         if False else '-Split-')
