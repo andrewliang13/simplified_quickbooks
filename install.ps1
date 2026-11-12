@@ -13,11 +13,13 @@ $zipUrl = if ($env:SQB_ZIP_URL) { $env:SQB_ZIP_URL } else { 'https://github.com/
 $dest = if ($env:SQB_HOME) { $env:SQB_HOME } else { Join-Path $HOME 'SimplifiedQuickBooks' }
 
 function Find-Python {
-    foreach ($cand in @(@('py', '-3'), @('python'), @('python3'))) {
+    # Returns a command line such as 'py -3' or 'python', or $null.
+    foreach ($cmd in @('py -3', 'python', 'python3')) {
+        $parts = $cmd -split ' '
+        $rest = @($parts | Select-Object -Skip 1)
         try {
-            $exe = $cand[0]; $args0 = @($cand | Select-Object -Skip 1)
-            & $exe @args0 -c "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)" 2>$null
-            if ($LASTEXITCODE -eq 0) { return ,$cand }
+            & $parts[0] @rest -c "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)" 2>$null
+            if ($LASTEXITCODE -eq 0) { return $cmd }
         } catch { }
     }
     return $null
@@ -34,10 +36,10 @@ if (-not $py) {
     }
     if (-not $py) {
         Write-Host 'Please install Python from https://www.python.org/downloads/ (tick "Add python.exe to PATH"), then run this installer again.'
-        exit 1
+        return
     }
 }
-$pyExe = $py[0]; $pyArgs = @($py | Select-Object -Skip 1)
+$pyParts = $py -split ' '; $pyExe = $pyParts[0]; $pyArgs = @($pyParts | Select-Object -Skip 1)
 Write-Host ('Using ' + (& $pyExe @pyArgs --version 2>&1))
 
 # 2. Download and unpack the app (code only; your data files are never in the download)
