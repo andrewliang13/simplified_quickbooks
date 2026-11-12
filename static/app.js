@@ -517,7 +517,7 @@ function namesPage(kind) {
       <button class="primary" id="n-new">New ${kind}</button></div>
       <div class="tbl"><table><thead><tr><th>Name</th><th>Company</th><th>Email</th><th>Phone</th><th class="num">${kind === 'customer' ? 'Open balance' : 'Balance owed'}</th><th></th></tr></thead>
       <tbody>${list.map(n => `<tr class="${n.active ? '' : 'muted'}"><td>${esc(n.name)}${n.active ? '' : ' <span class="badge">inactive</span>'}</td>
-        <td>${esc(n.company)}</td><td>${esc(n.email)}</td><td>${esc(n.phone)}</td><td class="num">${amt(n.balance)}${n.currency ? ' <span class="badge">' + n.currency + '</span>' : ''}</td>
+        <td>${esc(n.company)}</td><td>${esc(n.email)}</td><td>${esc(n.phone)}</td><td class="num">${amt(n.balance)}${n.currency && n.currency !== home() ? ' <span class="badge">' + n.currency + '</span>' : ''}</td>
         <td class="actions">${kind === 'customer' && n.active ? `<button class="small" data-inv="${n.id}">New invoice</button>` : ''}${kind === 'vendor' && n.active ? `<button class="small" data-bill="${n.id}">New bill</button>` : ''}
         <button class="small" data-edit="${n.id}">Edit</button>
         <button class="small" data-toggle="${n.id}">${n.active ? 'Make inactive' : 'Make active'}</button>

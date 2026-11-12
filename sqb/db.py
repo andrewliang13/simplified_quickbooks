@@ -291,7 +291,7 @@ DEFAULT_ACCOUNTS = [
     ('6030', 'Legal and Professional Services', 'Expense', None),
     ('6040', 'Meals and Entertainment', 'Expense', None),
     ('6050', 'Office Supplies and Software', 'Expense', None),
-    ('6060', 'Payroll Expenses', 'Expense', None),
+    ('6060', 'Payroll Expenses', 'Expense', 'wages'),
     ('6065', 'Payroll Tax Expense', 'Expense', 'ptx'),
     ('6070', 'Rent and Lease', 'Expense', None),
     ('6080', 'Repairs and Maintenance', 'Expense', None),
@@ -311,6 +311,7 @@ SYSTEM_ACCOUNTS = [('ap', '2000', 'Accounts Payable', 'Accounts Payable'),
                    ('pl', '2200', 'Payroll Liabilities', 'Other Current Liability'),
                    ('tax', '2300', 'Sales Tax Payable', 'Other Current Liability'),
                    ('ptx', '6065', 'Payroll Tax Expense', 'Expense'),
+                   ('wages', '6060', 'Payroll Expenses', 'Expense'),
                    ('fx', '8100', 'Exchange Gain or Loss', 'Other Expense')]
 
 # Columns added after the first release: (table, column, declaration)
@@ -322,7 +323,9 @@ COLUMNS = [('feed', 'fitid', 'TEXT'), ('reconciliations', 'snapshot', 'TEXT'),
            ('invoices', 'tax_rate_id', 'INTEGER'), ('invoices', 'tax', 'INTEGER NOT NULL DEFAULT 0'),
            ('invoice_lines', 'item_id', 'INTEGER'), ('invoice_lines', 'taxable', 'INTEGER NOT NULL DEFAULT 0'),
            ('payments', 'exchange_rate', "TEXT NOT NULL DEFAULT '1'"), ('payments', 'ctrl_home', 'INTEGER'),
-           ('payment_apps', 'home', 'INTEGER')]
+           ('payment_apps', 'home', 'INTEGER'),
+           ('inv_moves', 'kind', "TEXT NOT NULL DEFAULT 'in'"), ('inv_moves', 'cogs_account_id', 'INTEGER'),
+           ('inv_moves', 'asset_account_id', 'INTEGER'), ('lines', 'kind', "TEXT NOT NULL DEFAULT ''")]
 
 
 def connect(path):
@@ -362,9 +365,29 @@ def init(path):
                     n += 1
                 conn.execute('INSERT INTO accounts(number, name, type, system) VALUES (?,?,?,?)',
                              ('' if taken else number, name if n == 2 else '%s %d' % (name, n - 1), atype, code))
+        if get_setting(conn, 'inventory_costing', '') != '2':
+            _upgrade_inventory(conn)
+            set_setting(conn, 'inventory_costing', '2')
         conn.commit()
     finally:
         conn.close()
+
+
+def _upgrade_inventory(conn):
+    """Earlier versions fixed the cost of each sale when it was saved. Convert those sales to moves whose
+    cost is recalculated in date order, then recalculate every item."""
+    from . import items
+    for m in conn.execute("SELECT m.*, i.expense_account_id AS ex, i.asset_account_id AS ast FROM inv_moves m "
+                          "JOIN items i ON i.id = m.item_id JOIN transactions t ON t.id = m.txn_id "
+                          "WHERE t.type = 'Invoice' AND m.kind = 'in'").fetchall():
+        conn.execute("UPDATE inv_moves SET kind='out', cogs_account_id=?, asset_account_id=? WHERE id=?",
+                     (m['ex'], m['ast'], m['id']))
+        conn.execute("DELETE FROM lines WHERE txn_id=? AND kind='' AND ((account_id=? AND debit>0) OR "
+                     "(account_id=? AND credit>0)) AND memo IN (SELECT description FROM invoice_lines il JOIN "
+                     "invoices v ON v.id = il.invoice_id WHERE v.txn_id=? AND il.item_id=?)",
+                     (m['txn_id'], m['ex'], m['ast'], m['txn_id'], m['item_id']))
+    for (iid,) in conn.execute('SELECT id FROM items').fetchall():
+        items.recost(conn, iid)
 
 
 DEFAULTS = {'home_currency': 'USD', 'ss_rate': '6.2', 'ss_wage_base': '184500', 'medicare_rate': '1.45',

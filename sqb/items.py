@@ -50,9 +50,77 @@ def unit_cost(conn, item, as_of, exclude_txn=None):
     return Decimal(item['purchase_cost'])
 
 
-def add_move(conn, item_id, txn_id, date, qty, value):
-    conn.execute('INSERT INTO inv_moves(item_id, txn_id, date, qty, value) VALUES (?,?,?,?,?)',
-                 (item_id, txn_id, date, float(qty), int(value)))
+def add_move(conn, item_id, txn_id, date, qty, value, kind='in', cogs_account_id=None, asset_account_id=None):
+    """kind 'in': stock whose value is known (purchase, opening quantity, count increase).
+    kind 'out': stock leaving (sale, count decrease); its cost is worked out by recost()."""
+    conn.execute('INSERT INTO inv_moves(item_id, txn_id, date, qty, value, kind, cogs_account_id, asset_account_id) '
+                 'VALUES (?,?,?,?,?,?,?,?)', (item_id, txn_id, date, float(qty), int(value), kind, cogs_account_id,
+                                              asset_account_id))
+
+
+def recost(conn, item_id):
+    """Work out the cost of every sale and count decrease of an item in date order at average cost, and
+    rewrite their cost-of-goods lines. Run after anything that changes the item's history, so a back-dated
+    or edited purchase re-costs the sales after it (as QuickBooks does). Selling stock you do not have is
+    costed at the last average; the difference is corrected on that sale when the stock arrives, so no
+    value is left when the quantity is back to zero."""
+    it = conn.execute('SELECT * FROM items WHERE id=?', (item_id,)).fetchone()
+    if not it:
+        return
+    moves = conn.execute('SELECT * FROM inv_moves WHERE item_id=? ORDER BY date, id', (item_id,)).fetchall()
+    qty, val, last, pending = Decimal(0), 0, Decimal(it['purchase_cost']), None
+    new = {}
+    for m in moves:
+        q = Decimal(str(m['qty']))
+        if m['kind'] != 'out':
+            v = m['value']
+            if qty < 0 and q > 0 and pending is not None:
+                s = min(-qty, q)
+                corr = cents_of(s * Decimal(v) / q + Decimal(val) * s / (-qty))
+                if corr:
+                    new[pending] -= corr
+                    val -= corr
+            qty += q
+            val += v
+        else:
+            out = -q
+            unit = Decimal(val) / qty if qty > 0 else last
+            cost = val if (qty > 0 and out == qty) else cents_of(out * unit)
+            new[m['id']] = -cost
+            qty -= out
+            val -= cost
+            if qty < 0:
+                pending = m['id']
+        if qty > 0:
+            last = Decimal(val) / qty
+        elif qty == 0:
+            pending = None
+    touched = set()
+    for m in moves:
+        if m['kind'] == 'out' and new.get(m['id'], m['value']) != m['value']:
+            conn.execute('UPDATE inv_moves SET value=? WHERE id=?', (new[m['id']], m['id']))
+            touched.add(m['txn_id'])
+        elif m['kind'] == 'out' and not conn.execute("SELECT 1 FROM lines WHERE txn_id=? AND kind='cogs' LIMIT 1",
+                                                     (m['txn_id'],)).fetchone() and m['value']:
+            touched.add(m['txn_id'])
+    for tid in touched:
+        regen_cost_lines(conn, tid)
+
+
+def regen_cost_lines(conn, txn_id):
+    """Rewrite a transaction's cost-of-goods lines (Dr cost account, Cr inventory asset) from its moves."""
+    conn.execute("DELETE FROM lines WHERE txn_id=? AND kind='cogs'", (txn_id,))
+    seq = conn.execute('SELECT COALESCE(MAX(seq), 0) FROM lines WHERE txn_id=?', (txn_id,)).fetchone()[0] + 1
+    for m in conn.execute("SELECT m.*, i.name FROM inv_moves m JOIN items i ON i.id = m.item_id "
+                          "WHERE m.txn_id=? AND m.kind='out' ORDER BY m.id", (txn_id,)).fetchall():
+        cost = -m['value']
+        if not cost:
+            continue
+        for acct, dr, cr in ((m['cogs_account_id'], max(cost, 0), max(-cost, 0)),
+                             (m['asset_account_id'], max(-cost, 0), max(cost, 0))):
+            conn.execute("INSERT INTO lines(txn_id, seq, account_id, debit, credit, memo, kind) "
+                         "VALUES (?,?,?,?,?,?,'cogs')", (txn_id, seq, acct, dr, cr, 'Cost of %s' % m['name']))
+            seq += 1
 
 
 def get_item(conn, item_id):
@@ -171,6 +239,7 @@ def create_item(ctx):
             tid = ctx.conn.execute('INSERT INTO transactions(date, type, ref, memo) VALUES (?,?,?,?)',
                                    (date, 'Inventory Qty Adjust', ref, memo)).lastrowid
         add_move(ctx.conn, iid, tid, date, qty, value)
+        recost(ctx.conn, iid)
     ctx.p['id'] = iid
     return read_item(ctx)
 
@@ -200,7 +269,9 @@ def adjust_qty(ctx):
     """Inventory quantity adjustment (count correction, shrinkage, damage). Increases are valued at the
     given unit cost (default: current average cost); decreases at the average cost."""
     conn, b = ctx.conn, ctx.body
-    it = get_item(conn, ctx.p['id'])
+    it = conn.execute('SELECT * FROM items WHERE id=?', (ctx.p['id'],)).fetchone()
+    if not it:
+        raise ApiError(404, 'Product or service not found')
     if it['type'] != 'inventory':
         raise ApiError(400, 'Only inventory items can be adjusted')
     date = parse_date(b.get('date') or today())
@@ -211,18 +282,24 @@ def adjust_qty(ctx):
     unit = Decimal(to_cents(b['unit_cost'], 'unit_cost')) if b.get('unit_cost') not in (None, '') and change > 0 else avg
     value = cents_of(change * unit)
     offset = as_int(b.get('account_id'), 'account', required=False) or it['expense_account_id']
-    if not conn.execute('SELECT 1 FROM accounts WHERE id=?', (offset,)).fetchone():
-        raise ApiError(400, 'Choose the adjustment account')
+    oa = conn.execute('SELECT * FROM accounts WHERE id=?', (offset,)).fetchone()
+    if not oa or oa['type'] not in ('Cost of Goods Sold', 'Expense', 'Other Expense', 'Other Income', 'Equity') \
+            or oa['id'] == it['asset_account_id']:
+        raise ApiError(400, 'Choose an expense or cost of goods sold account for the adjustment')
     memo = as_str(b.get('memo'), 'memo') or 'Quantity adjustment: %s' % it['name']
-    if value:
+    ref = ledger.next_ref(conn, 'Inventory Qty Adjust')
+    if change > 0 and value:
         tid = ledger.post_txn(conn, date, 'Inventory Qty Adjust', [
             {'account_id': it['asset_account_id'], 'debit': value, 'memo': memo},
-            {'account_id': offset, 'credit': value, 'memo': memo}],
-            ref=ledger.next_ref(conn, 'Inventory Qty Adjust'), memo=memo)
-    else:
+            {'account_id': offset, 'credit': value, 'memo': memo}], ref=ref, memo=memo)
+    else:     # decreases are costed by recost() at the average cost on that date
         tid = conn.execute('INSERT INTO transactions(date, type, ref, memo) VALUES (?,?,?,?)',
-                           (date, 'Inventory Qty Adjust', ledger.next_ref(conn, 'Inventory Qty Adjust'), memo)).lastrowid
-    add_move(conn, it['id'], tid, date, change, value)
+                           (date, 'Inventory Qty Adjust', ref, memo)).lastrowid
+    if change > 0:
+        add_move(conn, it['id'], tid, date, change, value)
+    else:
+        add_move(conn, it['id'], tid, date, change, 0, 'out', offset, it['asset_account_id'])
+    recost(conn, it['id'])
     return _item_json(conn, it)
 
 

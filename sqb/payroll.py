@@ -32,11 +32,7 @@ def wage_account(conn):
     aid = db.get_setting(conn, 'payroll_wage_account', '')
     if aid and conn.execute('SELECT 1 FROM accounts WHERE id=?', (aid,)).fetchone():
         return int(aid)
-    r = conn.execute("SELECT id FROM accounts WHERE name='Payroll Expenses' COLLATE NOCASE").fetchone() or \
-        conn.execute("SELECT id FROM accounts WHERE name='Wages' COLLATE NOCASE").fetchone()
-    if r:
-        return r[0]
-    return conn.execute("INSERT INTO accounts(number, name, type) VALUES ('', 'Wages', 'Expense')").lastrowid
+    return db.system_account(conn, 'wages')     # "Payroll Expenses" (follows renames)
 
 
 # ---------------------------------------------------------------- employees
@@ -172,7 +168,10 @@ def calc_route(ctx):
     date = parse_date(ctx.body.get('pay_date') or today(), 'pay_date')
     hours, gross, over = _inputs(ctx.conn, ctx.body, e)
     c = calculate(ctx.conn, e, date, gross, over, as_int(ctx.body.get('paycheck_id'), 'paycheck_id', required=False))
-    return {k: money(v) for k, v in c.items()}
+    out = {k: money(v) for k, v in c.items()}
+    if c['net'] < 0:
+        out['warning'] = 'Withholdings are more than gross pay'
+    return out
 
 
 def save_paycheck(conn, b, pid=None):
@@ -181,6 +180,19 @@ def save_paycheck(conn, b, pid=None):
         ex = conn.execute('SELECT * FROM paychecks WHERE id=?', (pid,)).fetchone()
         if not ex:
             raise ApiError(404, 'Paycheck not found')
+        # Fields left out of an edit keep their saved values. If the pay itself changes (employee, date,
+        # hours or gross), taxes not typed in this edit are calculated again.
+        keep = {'employee_id': ex['employee_id'], 'pay_date': ex['pay_date'], 'period_start': ex['period_start'],
+                'period_end': ex['period_end'], 'bank_account_id': ex['bank_account_id'], 'check_no': ex['check_no'],
+                'memo': ex['memo'], 'hours': ex['hours']}
+        pay_changed = any(k in b and str(b[k]) != str(keep.get(k, '')) for k in ('employee_id', 'pay_date', 'hours')) \
+            or ('gross' in b and to_cents(b['gross'], 'gross') != ex['gross'])
+        if not ('hours' in b and 'gross' not in b):
+            keep['gross'] = money(ex['gross'])
+        if not pay_changed:
+            keep.update({k: money(ex[k]) for k in AMOUNTS if k != 'gross'})
+        keep.update(b)
+        b = keep
     e = _emp(conn, b.get('employee_id') or (ex and ex['employee_id']))
     if not e['active'] and not (ex and ex['employee_id'] == e['id']):
         raise ApiError(400, 'This employee is inactive')
@@ -296,6 +308,8 @@ def put_payroll_settings(ctx):
                 raise ApiError(400, 'Wages must post to an expense account')
             db.set_setting(ctx.conn, 'payroll_wage_account', as_int(v, k))
         elif k in db.DEFAULTS and k != 'home_currency':
+            if v in (None, '') or isinstance(v, str) and not v.strip():
+                raise ApiError(400, '%s cannot be blank' % k)
             hi = Decimal(100) if k.endswith('_rate') else Decimal(10 ** 8)
             db.set_setting(ctx.conn, k, format(items.dec(v, k, lo=Decimal(0), hi=hi).normalize(), 'f'))
         else:

@@ -60,12 +60,19 @@ def _parse_payload(ctx):
         raise ApiError(400, 'The file is empty')
     rows, meta = parsers.parse_statement(data, as_str(b.get('filename'), 'filename'),
                                          acct['type'] == 'Credit Card',
-                                         as_int(b.get('year'), 'year', required=False))
+                                         _year(b.get('year')))
     rows = [r for r in rows if r['amount'] != 0]
     if b.get('flip_sign'):
         for r in rows:
             r['amount'] = -r['amount']
     return acct, _dedupe(ctx.conn, acct, rows), meta
+
+
+def _year(v):
+    y = as_int(v, 'year', required=False)
+    if y is not None and not 1900 <= y <= 2999:
+        raise ApiError(400, 'year must be between 1900 and 2999')
+    return y
 
 
 def _dedupe(conn, acct, rows):
@@ -181,8 +188,9 @@ def _matches(conn, row, acct_type):
         udf = db.system_account(conn, 'udf')
         held = ledger.account_net(conn, udf, end=row['date']) if udf else 0
         pays = conn.execute('SELECT p.*, n.name FROM payments p JOIN names n ON n.id = p.customer_id '
-                            'WHERE p.deposit_account_id=? AND p.amount=? AND p.date <= ? ORDER BY p.date DESC',
-                            (udf, row['amount'], row['date'])).fetchall()
+                            'JOIN lines l ON l.txn_id = p.txn_id AND l.account_id = p.deposit_account_id '
+                            'WHERE p.deposit_account_id=? AND l.debit - l.credit = ? AND p.date <= ? '
+                            'ORDER BY p.date DESC', (udf, row['amount'], row['date'])).fetchall()
         if held >= row['amount'] and (pays or held == row['amount']):
             who = 'payment from %s on %s' % (pays[0]['name'], pays[0]['date']) if pays else 'all payments held'
             out.append({'kind': 'undeposited', 'date': pays[0]['date'] if pays else row['date'],
@@ -303,8 +311,16 @@ def edit_categories(ctx):
     if not anchor:
         raise ApiError(400, 'This transaction has no bank or card side')
     others = [l for l in lines if l['id'] != anchor['id']]
-    if any(l['recon_status'] for l in others):
+    if any(l['recon_status'] == 'R' for l in others):
         raise ApiError(409, 'The other side of this transfer is reconciled. Undo that reconciliation first.')
+    if any(l['recon_status'] == 'C' for l in others):
+        raise ApiError(409, 'The other side of this transfer is ticked in a reconciliation in progress. '
+                            'Untick it there first.')
+    linked_other = conn.execute('SELECT f.id FROM feed f WHERE f.line_id IN (%s)' % ','.join('?' * len(others)),
+                                [l['id'] for l in others]).fetchone() if others else None
+    if linked_other:
+        raise ApiError(409, 'The other side of this transfer is on another account\'s statement. '
+                            'Undo it there first, then edit this one.')
     acct = conn.execute('SELECT * FROM accounts WHERE id=?', (anchor['account_id'],)).fetchone()
     net = anchor['debit'] - anchor['credit']
     money_in, total = net > 0, abs(net)
@@ -330,8 +346,9 @@ def edit_categories(ctx):
     memo = as_str(b['memo'], 'memo') if 'memo' in b else t['memo']
     conn.execute('DELETE FROM lines WHERE txn_id=? AND id<>?', (t['id'], anchor['id']))
     for i, s in enumerate(splits, 1):
+        net_line = -s['amount'] if money_in else s['amount']       # debit - credit
         conn.execute('INSERT INTO lines(txn_id, seq, account_id, debit, credit, memo, name_id) VALUES (?,?,?,?,?,?,?)',
-                     (t['id'], i, s['account_id'], 0 if money_in else s['amount'], s['amount'] if money_in else 0,
+                     (t['id'], i, s['account_id'], max(net_line, 0), max(-net_line, 0),
                       s['memo'] or anchor['memo'], None))
     conn.execute('UPDATE transactions SET date=?, memo=?, name_id=?, type=? WHERE id=?',
                  (date, memo, name_id, _txn_type(acct, cats, money_in), t['id']))
@@ -366,6 +383,8 @@ def categorize(conn, row, splits, name_id=None, memo=''):
         if c['type'] == 'Accounts Receivable':
             raise ApiError(400, 'To record a customer payment, match the deposit to an invoice '
                                 'or use Receive Payment')
+        if c['type'] == 'Accounts Payable':
+            raise ApiError(400, 'To record a bill payment, match the payment to the bill or use Pay Bills')
         cats.append(c)
     ttype = _txn_type(acct, cats, money_in)
     bank_line = {'account_id': acct['id'], 'memo': row['description'],
@@ -459,6 +478,8 @@ def match_one(ctx):
         if row['amount'] <= 0:
             raise ApiError(400, 'Only deposits can be matched to invoices')
         inv = invoices.get_invoice(conn, as_int(ctx.body['invoice_id'], 'invoice_id'))
+        if inv['currency'] != inv_home(conn):
+            raise ApiError(400, 'Foreign-currency invoices are paid with Receive Payment')
         if inv['balance_cents'] < row['amount']:
             raise ApiError(400, 'The deposit is larger than the open balance of this invoice')
         pid = invoices.save_payment(conn, {

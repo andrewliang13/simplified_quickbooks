@@ -43,7 +43,7 @@ def _clean(conn, lines):
             raise ApiError(400, 'Unknown customer/vendor on a line')
         out.append({'account_id': int(acct), 'debit': net if net > 0 else 0,
                     'credit': -net if net < 0 else 0,
-                    'memo': str(ln.get('memo') or '').strip(), 'name_id': name_id})
+                    'memo': str(ln.get('memo') or '').strip(), 'name_id': name_id, 'kind': ln.get('kind') or ''})
     if len(out) < 2:
         raise ApiError(400, 'A transaction needs at least two lines with amounts')
     td, tc = sum(l['debit'] for l in out), sum(l['credit'] for l in out)
@@ -78,8 +78,8 @@ def post_txn(conn, date, ttype, lines, ref='', memo='', name_id=None, txn_id=Non
     new_ids = []
     for i, l in enumerate(lines):
         cur = conn.execute(
-            'INSERT INTO lines(txn_id, seq, account_id, debit, credit, memo, name_id) VALUES (?,?,?,?,?,?,?)',
-            (txn_id, i, l['account_id'], l['debit'], l['credit'], l['memo'], l['name_id']))
+            'INSERT INTO lines(txn_id, seq, account_id, debit, credit, memo, name_id, kind) VALUES (?,?,?,?,?,?,?,?)',
+            (txn_id, i, l['account_id'], l['debit'], l['credit'], l['memo'], l['name_id'], l['kind']))
         new_ids.append((cur.lastrowid, l['account_id'], l['debit'] - l['credit']))
     # An edit that leaves the bank-side line alone keeps its in-progress reconcile check mark.
     marked = set()
@@ -122,11 +122,16 @@ def delete_txn(conn, txn_id):
             conn.execute('DELETE FROM %s WHERE payment_id=?' % apps, (p['id'],))
             conn.execute('DELETE FROM %s WHERE id=?' % pay, (p['id'],))
     conn.execute('DELETE FROM paychecks WHERE txn_id=?', (txn_id,))
+    moved = [r[0] for r in conn.execute('SELECT DISTINCT item_id FROM inv_moves WHERE txn_id=?', (txn_id,))]
     conn.execute('DELETE FROM inv_moves WHERE txn_id=?', (txn_id,))
     conn.execute("UPDATE feed SET status='review', line_id=NULL, created_txn=0 "
                  'WHERE line_id IN (SELECT id FROM lines WHERE txn_id=?)', (txn_id,))
     conn.execute('DELETE FROM lines WHERE txn_id=?', (txn_id,))
     conn.execute('DELETE FROM transactions WHERE id=?', (txn_id,))
+    if moved:
+        from . import items
+        for iid in moved:
+            items.recost(conn, iid)
 
 
 def txn_json(conn, txn_id):

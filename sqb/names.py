@@ -55,8 +55,7 @@ def _clean(conn, body, existing=None):
     cur = as_str(cur, 'currency').upper()
     if cur and not re.fullmatch(r'[A-Z]{3}', cur):
         raise ApiError(400, 'Currency must be a 3-letter code such as USD, EUR or CAD')
-    cur = '' if cur == home else cur
-    if existing and cur != (existing['currency'] or '') and _used(conn, existing['id']):
+    if existing and (cur or home) != (existing['currency'] or home) and _used(conn, existing['id']):
         raise ApiError(400, 'The currency cannot change once this name has transactions')
     vals['currency'] = cur
     vals['active'] = 1 if as_bool(body['active'] if 'active' in body

@@ -44,8 +44,11 @@ def parse_rate(v, currency, home):
         raise ApiError(400, 'Enter the exchange rate: how many %s for 1 %s' % (home, currency))
     if isinstance(v, (bool, list, dict)):
         raise ApiError(400, 'exchange_rate: invalid number')
+    sv = str(v).strip()
+    if ',' in sv and '.' not in sv:
+        raise ApiError(400, 'Use a dot for decimals in the exchange rate (for example 1.10)')
     try:
-        r = Decimal(str(v).replace(',', '').strip())
+        r = Decimal(sv.replace(',', ''))
     except InvalidOperation:
         raise ApiError(400, 'exchange_rate: invalid number')
     if not r.is_finite() or r <= 0 or r > 10 ** 6:
@@ -218,6 +221,9 @@ def _lines(conn, side, body, existing_items):
         if acct['type'] in bad:
             raise ApiError(400, 'Line %d: choose an %s account, not a bank, card, A/R or A/P account'
                            % (i, 'income' if side is SALES else 'expense'))
+        if side is SALES and (acct['system'] == 'inv' or conn.execute(
+                "SELECT 1 FROM items WHERE type='inventory' AND asset_account_id=? LIMIT 1", (acct['id'],)).fetchone()):
+            raise ApiError(400, 'Line %d: sales cannot be posted to an inventory asset account' % i)
         if item and item['type'] == 'inventory' and side is PURCHASE and acct['id'] != item['asset_account_id']:
             raise ApiError(400, 'Line %d: inventory purchases go to the item\'s inventory asset account' % i)
         if item and item['type'] == 'inventory' and qty <= 0 and amt > 0:
@@ -230,14 +236,19 @@ def _lines(conn, side, body, existing_items):
 
 
 def save_doc(conn, side, body, doc_id=None):
-    name = name_row(conn, side, body.get(side.name_col))
-    date = parse_date(body.get('date') or today())
-    terms, due = _due(body, date, side)
     existing = None
     if doc_id:
         existing = conn.execute('SELECT * FROM %s WHERE id=?' % side.doc, (doc_id,)).fetchone()
         if not existing:
             raise ApiError(404, '%s not found' % side.label)
+        body = dict(body)
+        for k in ('date', 'memo', side.name_col):
+            body.setdefault(k, existing[k])
+        if 'terms' not in body and 'due_date' not in body:
+            body['terms'], body['due_date'] = existing['terms'], existing['due_date']
+    name = name_row(conn, side, body.get(side.name_col))
+    date = parse_date(body.get('date') or today())
+    terms, due = _due(body, date, side)
     used_items = set()
     if existing:
         used_items = {r[0] for r in conn.execute('SELECT item_id FROM %s WHERE %s=?' % (side.lines, side.fk),
@@ -261,7 +272,8 @@ def save_doc(conn, side, body, doc_id=None):
     currency = currency_of(conn, name)
     if body.get('currency') not in (None, '') and str(body['currency']).upper() != currency:
         raise ApiError(400, '%s %s uses %s' % (side.kind.capitalize(), name['name'], currency))
-    rate = parse_rate(body.get('exchange_rate') if 'exchange_rate' in body or not existing
+    same_cur = existing and (existing['currency'] or home) == currency
+    rate = parse_rate(body.get('exchange_rate') if 'exchange_rate' in body or not same_cur
                       else existing['exchange_rate'], currency, home)
     number = as_str(body.get('number'), 'number')
     if existing:
@@ -286,17 +298,20 @@ def save_doc(conn, side, body, doc_id=None):
     memo = as_str(body.get('memo'), 'memo')
     ctrl = db.system_account(conn, side.ctrl)
     s = side.sign
-    post, home_total = [], 0
+    post = []
     for l in lines:
-        h = to_home(l['amount'], rate)
-        home_total += h
-        post.append({'account_id': l['account_id'], 'debit' if s < 0 else 'credit': h, 'name_id': name['id'],
-                     'memo': l['description']})
+        post.append({'account_id': l['account_id'], 'debit' if s < 0 else 'credit': to_home(l['amount'], rate),
+                     'name_id': name['id'], 'memo': l['description']})
     if tax:
-        h = to_home(tax, rate)
-        home_total += h
-        post.append({'account_id': db.system_account(conn, 'tax'), 'credit': h, 'name_id': name['id'],
+        post.append({'account_id': db.system_account(conn, 'tax'), 'credit': to_home(tax, rate), 'name_id': name['id'],
                      'memo': 'Sales tax'})
+    # The home total is the document total converted once (as QuickBooks does); any rounding difference
+    # from converting line by line goes on the largest line.
+    home_total = to_home(total, rate)
+    key = 'debit' if s < 0 else 'credit'
+    diff = home_total - sum(p[key] for p in post)
+    if diff:
+        max(post, key=lambda p: abs(p[key]))[key] += diff
     post.insert(0, {'account_id': ctrl, 'debit' if s > 0 else 'credit': home_total, 'name_id': name['id'],
                     'memo': memo})
     txn_id = existing['txn_id'] if existing else None
@@ -306,19 +321,18 @@ def save_doc(conn, side, body, doc_id=None):
         it = l['item']
         if not it or it['type'] != 'inventory':
             continue
-        if side is SALES:
-            cost = items.cents_of(l['qty'] * items.unit_cost(conn, it, date, txn_id))
-            if cost:
-                post.append({'account_id': it['expense_account_id'], 'debit': cost, 'memo': l['description']})
-                post.append({'account_id': it['asset_account_id'], 'credit': cost, 'memo': l['description']})
-            moves.append((it['id'], -l['qty'], -cost))
+        if side is SALES:     # cost is worked out by items.recost(), in date order
+            moves.append((it['id'], -l['qty'], 0, 'out', it['expense_account_id'], it['asset_account_id']))
         else:
-            moves.append((it['id'], l['qty'], to_home(l['amount'], rate)))
+            moves.append((it['id'], l['qty'], to_home(l['amount'], rate), 'in', None, None))
+    before = {r[0] for r in conn.execute('SELECT item_id FROM inv_moves WHERE txn_id=?', (txn_id,))} if txn_id else set()
     tid = ledger.post_txn(conn, date, side.doc_type, post, ref=number, memo=memo, name_id=name['id'],
                           txn_id=txn_id)
     conn.execute('DELETE FROM inv_moves WHERE txn_id=?', (tid,))
-    for iid, q, v in moves:
-        items.add_move(conn, iid, tid, date, q, v)
+    for iid, q, v, kind, cogs, asset in moves:
+        items.add_move(conn, iid, tid, date, q, v, kind, cogs, asset)
+    for iid in before | {m[0] for m in moves}:
+        items.recost(conn, iid)
     vals = (name['id'], number, date, due, terms, memo, total, home_total, currency if currency != home else '',
             rate_str(rate), tax_rate_id, tax)
     cols = (side.name_col, 'number', 'date', 'due_date', 'terms', 'memo', 'total', 'total_home', 'currency',
@@ -330,6 +344,13 @@ def save_doc(conn, side, body, doc_id=None):
         doc_id = conn.execute('INSERT INTO %s(txn_id, %s) VALUES (?,%s)' % (side.doc, ','.join(cols),
                                                                            ','.join('?' * len(cols))),
                               (tid,) + vals).lastrowid
+    if existing and currency != home:
+        for (pid,) in conn.execute('SELECT DISTINCT payment_id FROM %s WHERE %s=?' % (side.apps, side.fk),
+                                   (doc_id,)).fetchall():
+            p = conn.execute('SELECT * FROM %s WHERE id=?' % side.pay, (pid,)).fetchone()
+            save_pay(conn, side, {'name_id': p[side.name_col], 'date': p['date'], 'amount_cents': p['amount'],
+                                  'account_id': p[side.acct_col], 'exchange_rate': p['exchange_rate'],
+                                  'method': p['method'], 'ref': p['ref'], 'memo': p['memo'], 'applications': None}, pid)
     for i, l in enumerate(lines):
         conn.execute('INSERT INTO %s(%s, seq, description, qty, rate, amount, account_id, item_id, taxable) '
                      'VALUES (?,?,?,?,?,?,?,?,?)' % (side.lines, side.fk),

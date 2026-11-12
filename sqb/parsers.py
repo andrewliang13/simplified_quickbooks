@@ -14,7 +14,7 @@ from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from .util import ApiError
 
 DATE_FORMATS = ['%Y-%m-%d', '%m/%d/%Y', '%m/%d/%y', '%m-%d-%Y', '%m-%d-%y', '%Y/%m/%d', '%d-%b-%Y', '%d-%b-%y',
-                '%b %d, %Y', '%B %d, %Y', '%d %b %Y', '%d %B %Y', '%Y%m%d', '%m.%d.%Y']
+                '%b %d, %Y', '%B %d, %Y', '%b %d %Y', '%B %d %Y', '%d %b %Y', '%d %B %Y', '%Y%m%d', '%m.%d.%Y']
 
 
 def parse_any_date(s, default_year=None):
@@ -25,13 +25,13 @@ def parse_any_date(s, default_year=None):
     for f in DATE_FORMATS:
         try:
             return datetime.datetime.strptime(s, f).date().isoformat()
-        except ValueError:
+        except (ValueError, OverflowError):
             pass
     m = re.fullmatch(r'(\d{1,2})[/-](\d{1,2})', s)
     if m and default_year:
         try:
             return datetime.date(int(default_year), int(m.group(1)), int(m.group(2))).isoformat()
-        except ValueError:
+        except (ValueError, OverflowError):
             return None
     return None
 
@@ -206,80 +206,156 @@ def parse_ofx(text):
     return out, []
 
 
-# ---------------------------------------------------------------- PDF (best effort)
+# ---------------------------------------------------------------- PDF statement text -> rows
 
+_MON = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?'
+_D = r'(?:\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\*?|' + _MON + r'\s+\d{1,2}\*?)'   # 12/05, 12/05/25*, Dec 5
+_AMT = r'(?:-\s?\$?|\$\s?-?|\(\$?|\+\s?\$?)?[\d,]*\d?\.\d{2}\)?-?(?:\s?CR)?'
 _PDF_LINE = re.compile(
-    r'^\s*(\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)\s+'          # transaction date
-    r'(?:\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\s+)?'            # optional posting date
-    r'(.+?)\s+'                                              # description
-    r'(-?\(?\$?\s?[\d,]*\.\d{2}\)?-?(?:\s?CR)?)'             # amount
-    r'(?:\s+(-?\$?[\d,]*\.\d{2}-?))?\s*$', re.I)             # optional running balance
-_POS = ('deposit', 'credit', 'addition', 'interest paid', 'interest earned')
+    r'^\s*(' + _D + r')\s+'                    # transaction date
+    r'(?:' + _D + r'\s+)?'                      # optional posting date
+    r'(.+?)\s+'                                 # description
+    r'(' + _AMT + r')'                          # amount
+    r'(?:\s+(-?\$?[\d,]*\.\d{2}-?))?\s*$', re.I)  # optional running balance
+_TWO = re.compile(r'^\s*(' + _D + r'\s+\S.*?\s+' + _AMT + r')\s+(' + _D + r'\s+\S.*?\s+' + _AMT + r')\s*$', re.I)
+_CHECK = re.compile(r'^\s*(\d{3,7})\s*[\^*]?\s+(' + _D + r')\s+(' + _AMT + r')\s*$', re.I)
+_POS = ('deposit', 'credit', 'addition', 'interest paid', 'interest earned', 'refund')
 _NEG = ('withdrawal', 'debit', 'check', 'subtraction', 'purchase', 'fee', 'charge', 'payment', 'transactions')
+# Section headings start with one of these (so a wrapped description such as "Security deposit" is not one)
+_HEADINGS = re.compile(
+    r'^(deposits?|other credits?|credits?|additions?|electronic deposits?|atm (and|&) debit card (deposits?|withdrawals?)|'
+    r'payments?(,| and| &)? (other )?credits?|withdrawals?|other debits?|'
+    r'electronic withdrawals?|other withdrawals?|checks?|checks paid|card purchases?|purchases?|new charges?|charges?|'
+    r'fees?|service fees?|interest charged|transactions?|subtractions?|atm|debit card|cash advances?|other charges?)\b')
 _BAL = re.compile(r'(?:beginning|previous|opening|starting)\s+balance.*?(-?\$?[\d,]+\.\d{2})', re.I)
+_FULL_DATE = r'(\d{1,2}/\d{1,2}/\d{2,4}|' + _MON + r'\s+\d{1,2},?\s+\d{4})'
+
+
+def _statement_end(text):
+    """End date of the statement period, from 'X - Y', 'X through Y', 'X to Y' or 'Closing Date X'."""
+    head = '\n'.join(text.splitlines()[:40])
+    for m in re.finditer(_FULL_DATE + r'\s*(?:-|–|through|thru|to)\s*' + _FULL_DATE, head, re.I):
+        d = parse_any_date(_norm_month(m.group(2)))
+        if d:
+            return d
+    m = re.search(r'(?:closing|statement|period ending|ending)\s+date:?\s*' + _FULL_DATE, head, re.I)
+    if m:
+        return parse_any_date(_norm_month(m.group(1)))
+    return None
+
+
+def _norm_month(s):
+    return re.sub(r'\b(Sept)\b', 'Sep', re.sub(r'(?<=[A-Za-z])\.', '', s.strip()))
+
+
+def _short_date(s, end, default_year):
+    """A date without a year (12/05, Dec 5): the year of the statement end, or the year before for months
+    after the end month (a December line on a statement that ends in January)."""
+    s = _norm_month(s.rstrip('*'))
+    full = parse_any_date(s.replace('-', '/'))
+    if full and re.search(r'\d{2,4}$', s) and s.replace('-', '/').count('/') == 2:
+        return full
+    if default_year:
+        year = int(default_year)
+        return parse_any_date(s.replace('-', '/'), year) or parse_any_date('%s %d' % (s, year))
+    if end:
+        ey, em = int(end[:4]), int(end[5:7])
+    else:
+        t = datetime.date.today()
+        ey, em = t.year, t.month
+    d = parse_any_date(s.replace('-', '/'), ey) or parse_any_date('%s %d' % (s, ey))
+    if d and int(d[5:7]) > em:
+        d = parse_any_date(s.replace('-', '/'), ey - 1) or parse_any_date('%s %d' % (s, ey - 1))
+    return d
 
 
 def parse_pdf_text(text, is_cc=False, default_year=None):
     """Pull dated lines ending in an amount out of statement text (best effort).
-    Sign comes from, in order: a running-balance column, a 'CR' marker, the section heading
-    ('Deposits and other credits' / 'Withdrawals'), then the printed sign."""
-    years = sorted({int(y) for y in re.findall(r'\b(20\d{2})\b', text)})
-    if default_year:
-        year, spans = int(default_year), False
-    else:
-        counts = re.findall(r'\b(20\d{2})\b', text)
-        year = int(max(set(counts), key=counts.count)) if counts else datetime.date.today().year
-        # A statement running December -> January mentions both years: use the later for January.
-        spans = (year - 1 in years or year + 1 in years)
-        if year + 1 in years:
-            year += 1
+    Sign comes from, in order: the running-balance column (also when a bank prints the balance only on the
+    last line of each day), a 'CR' marker, the section heading ('Deposits and other credits' /
+    'Withdrawals'), then the printed sign."""
+    end = None if default_year else _statement_end(text)
     out, section, skip, prev_bal, one_table = [], 0, False, None, False
+    pending = []                       # rows whose sign is settled by the next running balance
+
+    def settle(bal):
+        nonlocal prev_bal
+        if prev_bal is not None and pending:
+            want = bal - prev_bal
+            hits = [signs for signs in _sign_options(len(pending))
+                    if sum(s * abs(r['amount']) for s, r in zip(signs, pending)) == want * (-1 if is_cc else 1)]
+            if len(hits) == 1:
+                for s, r in zip(hits[0], pending):
+                    r['amount'] = s * abs(r['amount'])
+        pending.clear()
+        prev_bal = bal
+
+    def add(date_s, desc, amt_s, bal_s):
+        date = _short_date(date_s, end, default_year)
+        amt = parse_amount(amt_s.replace(' ', ''))
+        if not date or amt is None:
+            return
+        bal = parse_amount(bal_s) if bal_s else None
+        if amt_s.upper().rstrip().endswith('CR'):
+            amt = abs(amt)
+        elif section:
+            amt = section * abs(amt)
+        elif one_table and not is_cc:
+            amt = -abs(amt)            # until a running balance says otherwise
+        elif is_cc:
+            amt = -amt                 # card statements list charges as positive numbers
+        row = {'date': date, 'description': re.sub(r'\s+', ' ', desc).strip(), 'amount': amt, 'fitid': None}
+        out.append(row)
+        if not section and not amt_s.upper().rstrip().endswith('CR'):
+            pending.append(row)
+        if bal is not None:
+            settle(bal)
+
     for raw in text.splitlines():
         line = raw.strip()
         low = line.lower()
         bm = _BAL.search(line)
-        if bm:
+        if bm and not _PDF_LINE.match(line):
             prev_bal = parse_amount(bm.group(1))
+            pending.clear()
+            continue
+        two = _TWO.match(line)
         m = _PDF_LINE.match(line)
-        if not m:
-            # A heading is a short line with no digits or colons (wrapped description lines have them).
-            if len(low) < 110 and not re.search(r'[\d:]', low) and not low.startswith('total'):
-                if 'balance' in low and ('daily' in low or 'ending' in low) and not any(w in low for w in _POS + _NEG):
-                    skip = True                       # e.g. "DAILY ENDING BALANCE" table
+        ck = _CHECK.match(line)
+        if not m and not ck:
+            if 'deposit' in low and 'withdrawal' in low and len(low) < 140 and not re.search(r'[\d$]', low):
+                skip, one_table, section = False, True, 0      # one table with both columns
+                continue
+            if len(low) < 70 and not re.search(r'[\d:$]', low) and not low.startswith('total'):
+                if 'summary' in low or ('balance' in low and ('daily' in low or 'ending' in low or 'ledger' in low)):
+                    skip = True        # summaries and daily balance tables are not transactions
                     continue
-                pos, neg = any(w in low for w in _POS), any(w in low for w in _NEG)
-                if pos or neg:
-                    skip = False
-                    one_table = (pos and neg and 'balance' in low) or ('deposit' in low and 'withdrawal' in low)
-                    section = 0 if one_table else (1 if pos else -1)
+                if _HEADINGS.match(low):
+                    pos, neg = any(w in low for w in _POS), any(w in low for w in _NEG)
+                    skip, one_table = False, False
+                    section = 1 if pos else -1 if neg else 0
             continue
-        if skip or re.match(r'^-?\$?[\d,]*\.\d{2}\s+\d{1,2}[/-]\d{1,2}\b', m.group(2)):
+        if skip:
             continue
-        ds = m.group(1).replace('-', '/')
-        date = parse_any_date(ds, year)
-        amt = parse_amount(m.group(3))
-        if not date or amt is None:
+        if ck and not m:
+            add(ck.group(2), 'Check ' + ck.group(1), ck.group(3), None)
             continue
-        if spans and ds.count('/') == 1 and int(ds.split('/')[0]) >= 10 and not default_year:
-            later = any(int(x.split('/')[0]) <= 3 for x in re.findall(r'(?m)^\s*(\d{1,2}/\d{1,2})\s', text))
-            if later:
-                date = parse_any_date(ds, year - 1) or date
-        bal = parse_amount(m.group(4)) if m.group(4) else None
-        if bal is not None and prev_bal is not None and abs(bal - prev_bal) == abs(amt) and amt:
-            amt = abs(amt) if (bal > prev_bal) != is_cc else -abs(amt)   # card balances rise with charges
-        elif m.group(3).upper().rstrip().endswith('CR'):
-            amt = abs(amt)
-        elif section:
-            amt = section * abs(amt)
-        elif one_table and bal is not None and not is_cc:
-            amt = -abs(amt)     # single-table statement, no earlier balance to compare: assume money out
-        elif is_cc:
-            amt = -amt          # card statements list charges as positive numbers
-        if bal is not None:
-            prev_bal = bal
-        out.append({'date': date, 'description': re.sub(r'\s+', ' ', m.group(2)).strip(), 'amount': amt,
-                    'fitid': None})
+        if two:
+            for half in (two.group(1), two.group(2)):
+                h = _PDF_LINE.match(half)
+                if h:
+                    add(h.group(1), h.group(2), h.group(3), None)
+            continue
+        if re.match(r'^-?\$?[\d,]*\.\d{2}\s+' + _D, m.group(2)):
+            continue
+        add(m.group(1), m.group(2), m.group(3), m.group(4))
     return out
+
+
+def _sign_options(n):
+    if n > 12:
+        return []
+    return [[1 if (k >> i) & 1 else -1 for i in range(n)] for k in range(2 ** n)]
 
 
 def pdf_to_text(data):

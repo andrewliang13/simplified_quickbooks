@@ -114,6 +114,11 @@ def tokens(data, i=0, end=None):
             if j == i:
                 j = i + 1
             w = data[i:j].decode('latin-1')
+            if w == 'ID':                      # inline image data: skip to the EI that ends it
+                k = re.compile(rb'\sEI(?=[\s]|$)').search(data, j + 1)
+                i = k.end() if k else end
+                yield Op('EI'), i
+                continue
             try:
                 yield (float(w) if any(ch in w for ch in '.eE') and not w.isalpha() else int(w)), j
             except ValueError:
@@ -196,8 +201,9 @@ class Doc:
                     head = [int(x) for x in body[:first].split()]
                     for k in range(n):
                         onum, off = head[2 * k], head[2 * k + 1]
+                        stop = first + head[2 * k + 3] if k + 1 < n else len(body)
                         if onum not in self.objs:
-                            self.objs[onum] = (parse_obj(body, first + off)[0], None)
+                            self.objs[onum] = (parse_obj(body, first + off, stop)[0], None)
                 except Exception:
                     continue
 
@@ -241,9 +247,15 @@ class Doc:
                 break
         out = []
 
+        seen = set()
+
         def walk(node, inherited, depth=0):
+            if isinstance(node, Ref):
+                if node.num in seen:
+                    return                     # a page tree that lists a node twice (or itself)
+                seen.add(node.num)
             node = self.get(node)
-            if not isinstance(node, dict) or depth > 30:
+            if not isinstance(node, dict) or depth > 30 or len(out) > 5000:
                 return
             res = node.get('Resources', inherited)
             if node.get('Type') == 'Pages' or 'Kids' in node:
@@ -261,12 +273,61 @@ class Doc:
 
 # ---------------------------------------------------------------- fonts
 
+# Glyph widths of Helvetica / Arial (1/1000 em) for codes 32-126, used for standard fonts without /Widths.
+_HELV = [278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278] + [556] * 10 + \
+    [278, 278, 584, 584, 584, 556, 1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778,
+     667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556, 333, 556, 556, 500, 556, 556,
+     278, 556, 556, 222, 222, 500, 222, 833, 556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334,
+     260, 334, 584]
+_GLYPHS = {'space': ' ', 'fi': 'fi', 'fl': 'fl', 'ff': 'ff', 'ffi': 'ffi', 'ffl': 'ffl', 'period': '.', 'comma': ',',
+           'hyphen': '-', 'minus': '-', 'endash': '\u2013', 'emdash': '\u2014', 'quoteright': "'", 'quoteleft': "'",
+           'quotedbl': '"', 'quotesingle': "'", 'dollar': '$', 'percent': '%', 'ampersand': '&', 'slash': '/',
+           'colon': ':', 'semicolon': ';', 'parenleft': '(', 'parenright': ')', 'numbersign': '#', 'asterisk': '*',
+           'at': '@', 'plus': '+', 'equal': '=', 'underscore': '_', 'zero': '0', 'one': '1', 'two': '2', 'three': '3',
+           'four': '4', 'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9', 'bullet': '\u2022',
+           'Euro': '\u20ac', 'sterling': '\u00a3', 'yen': '\u00a5', 'cent': '\u00a2', 'degree': '\u00b0'}
+
+
+def _glyph(name):
+    if len(name) == 1:
+        return name
+    if name in _GLYPHS:
+        return _GLYPHS[name]
+    m = re.fullmatch(r'uni([0-9A-Fa-f]{4})', name) or re.fullmatch(r'u([0-9A-Fa-f]{4,6})', name)
+    if m:
+        try:
+            return chr(int(m.group(1), 16))
+        except ValueError:
+            return ''
+    return None
+
+
 class Font:
     def __init__(self, doc, fd):
         fd = doc.get(fd) or {}
-        self.two_byte = fd.get('Subtype') == 'Type0'
+        self.type0 = self.two_byte = fd.get('Subtype') == 'Type0'
         self.map = {}
+        self.diff = {}
         self.widths, self.default_w = {}, 500.0
+        base = str(doc.get(fd.get('BaseFont')) or '')
+        enc = doc.get(fd.get('Encoding'))
+        if isinstance(enc, dict):
+            code = 0
+            for x in doc.get(enc.get('Differences')) or []:
+                x = doc.get(x)
+                if isinstance(x, (int, float)):
+                    code = int(x)
+                elif isinstance(x, Name):
+                    g = _glyph(str(x))
+                    if g is not None:
+                        self.diff[code] = g
+                    code += 1
+        if not self.type0 and not fd.get('Widths'):
+            if 'Courier' in base:
+                self.default_w = 600.0
+            else:
+                self.widths = {32 + k: float(w) for k, w in enumerate(_HELV)}
+                self.default_w = 556.0
         if self.two_byte:
             desc = doc.get((doc.get(fd.get('DescendantFonts')) or [None])[0]) or {}
             self.default_w = float(doc.get(desc.get('DW')) or 1000)
@@ -281,8 +342,9 @@ class Font:
                             self.widths[c0 + k] = float(x)
                     i += 2
                 elif i + 2 < len(w):
-                    for c in range(int(c0), int(nxt) + 1):
-                        self.widths[c] = float(doc.get(w[i + 2]))
+                    if 0 <= int(nxt) - int(c0) <= 65536:
+                        for c in range(int(c0), int(nxt) + 1):
+                            self.widths[c] = float(doc.get(w[i + 2]))
                     i += 3
                 else:
                     break
@@ -311,7 +373,7 @@ class Font:
                 return ''
         for m in re.finditer(rb'begincodespacerange(.*?)endcodespacerange', data, re.S):
             lens = [len(x) // 2 for x in re.findall(rb'<([0-9A-Fa-f]+)>', m.group(1))]
-            if lens:
+            if lens and self.type0:            # only composite fonts use multi-byte codes
                 self.two_byte = max(lens) >= 2
         for m in re.finditer(rb'beginbfchar(.*?)endbfchar', data, re.S):
             for a, b in re.findall(rb'<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]*)>', m.group(1)):
@@ -337,8 +399,12 @@ class Font:
         return list(s)
 
     def char(self, c):
+        if c in self.map:
+            return self.map[c]
+        if c in self.diff:
+            return self.diff[c]
         if self.map:
-            return self.map.get(c, '' if self.two_byte else chr(c))
+            return '' if self.two_byte else bytes([c & 0xFF]).decode('cp1252', 'replace')
         if self.two_byte:
             return chr(c) if 32 <= c < 0x110000 else ''
         return bytes([c]).decode('cp1252', 'replace')
@@ -366,7 +432,7 @@ def _page_text(doc, page, res):
         row = sorted(lines[y], key=lambda p: (round(p[0], 1), p[2]))
         text, end = '', None
         for x0, x1, s, t, sz in row:
-            if end is not None and x0 - end > sz * 0.2 and not text.endswith(' ') and not t.startswith(' '):
+            if end is not None and x0 - end > sz * 0.1 and not text.endswith(' ') and not t.startswith(' '):
                 text += ' '
             text += t
             end = max(end or x1, x1)
@@ -381,7 +447,8 @@ def _content(doc, contents):
     return b'\n'.join(doc.stream_of(p) if isinstance(p, Ref) else b'' for p in parts)
 
 
-def _run(doc, data, res, ctm, pieces, depth):
+def _run(doc, data, res, ctm, pieces, depth, stack_refs=frozenset(), budget=None):
+    budget = budget if budget is not None else [500]     # form drawings per page
     res = doc.get(res) or {}
     fonts_dict = doc.get(res.get('Font')) or {}
     xobjects = doc.get(res.get('XObject')) or {}
@@ -419,9 +486,14 @@ def _run(doc, data, res, ctm, pieces, depth):
                 adv = w * st['th']
                 tm[4] += adv * tm[0]
                 tm[5] += adv * tm[1]
-        x1 = _mul(tm, ctm)[4]
+        e = _mul(tm, ctm)
+        dx, dy = m[0], m[1]
+        n = (dx * dx + dy * dy) ** 0.5 or 1
+        dx, dy = dx / n, dy / n
+        along0, along1 = x0 * dx + y0 * dy, e[4] * dx + e[5] * dy
+        across = -x0 * dy + y0 * dx
         if text.strip():
-            pieces.append((y0, min(x0, x1), max(x0, x1), len(pieces), text, st['size'] * scale))
+            pieces.append((across, min(along0, along1), max(along0, along1), len(pieces), text, st['size'] * scale))
 
     def next_line(tx, ty):
         tlm[:] = _mul([1, 0, 0, 1, tx, ty], tlm)
@@ -448,10 +520,11 @@ def _run(doc, data, res, ctm, pieces, depth):
         nums = [float(x) for x in a if isinstance(x, (int, float))]
         try:
             if op == 'q':
-                gs.append(ctm[:])
+                gs.append((ctm[:], dict(st)))
             elif op == 'Q':
                 if gs:
-                    ctm = gs.pop()
+                    ctm, saved = gs.pop()
+                    st.update(saved)
             elif op == 'cm' and len(nums) >= 6:
                 ctm = _mul(nums[:6], ctm)
             elif op == 'BT':
@@ -493,10 +566,13 @@ def _run(doc, data, res, ctm, pieces, depth):
             elif op == 'Do' and a and depth < 5:
                 ref = xobjects.get(a[-1])
                 xo = doc.get(ref)
-                if isinstance(xo, dict) and xo.get('Subtype') == 'Form' and isinstance(ref, Ref):
+                if isinstance(xo, dict) and xo.get('Subtype') == 'Form' and isinstance(ref, Ref) \
+                        and ref.num not in stack_refs and budget[0] > 0:
+                    budget[0] -= 1
                     mtx = doc.get(xo.get('Matrix')) or [1, 0, 0, 1, 0, 0]
                     _run(doc, doc.stream_of(ref), xo.get('Resources') or res,
-                         _mul([float(doc.get(x)) for x in mtx], ctm), pieces, depth + 1)
+                         _mul([float(doc.get(x)) for x in mtx], ctm), pieces, depth + 1,
+                         stack_refs | {ref.num}, budget)
         except (TypeError, ValueError, IndexError, KeyError, ZeroDivisionError):
             continue
 
@@ -504,7 +580,7 @@ def _run(doc, data, res, ctm, pieces, depth):
 def extract_text(data):
     if not data.startswith(b'%PDF'):
         raise ApiError(400, 'That file is not a PDF')
-    if re.search(rb'/Encrypt\s', data):
+    if re.search(rb'/Encrypt\s*[<\d]', data):
         raise ApiError(400, 'This PDF is password protected. Download an unprotected copy, or a CSV/QFX file.')
     try:
         doc = Doc(data)

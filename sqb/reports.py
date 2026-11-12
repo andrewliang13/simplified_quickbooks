@@ -1,6 +1,7 @@
 """Financial reports. Every amount cell carries the ledger 'segments' it was computed from,
 so the drill-down (transaction breakdown) always adds up to the number shown."""
 import datetime
+import re
 
 from . import db, documents as docs, invoices, ledger
 from .accounts import GROUP, PL_TYPES, TYPE_ORDER, TYPES, normal_sign, ordered
@@ -107,7 +108,10 @@ def cat(*fns):
 # ---------------------------------------------------------------- accounting basis
 
 def basis_of(params):
-    b = (params.get('basis') or 'accrual').lower()
+    b = params.get('basis') or 'accrual'
+    if not isinstance(b, str):
+        raise ApiError(400, 'basis must be accrual or cash')
+    b = b.lower()
     if b not in ('accrual', 'cash'):
         raise ApiError(400, 'basis must be accrual or cash')
     return b
@@ -145,28 +149,40 @@ def source(conn, basis):
                      l['name_id'], l['recon_status'], l['date']))
     next_id = (conn.execute('SELECT COALESCE(MAX(id), 0) FROM lines').fetchone()[0] or 0) + 1
     docs_by_id = {(side.doc, d['id']): (d, ctrl) for side, d, ctrl in doc_txn.values()}
+    seqs = {}
+    per_doc = {}          # (doc table, doc id) -> [(payment date, payment id, payment txn, payment, app)]
     for ptid, (side, p, ctrl) in pay_txn.items():
         apps = conn.execute('SELECT * FROM %s WHERE payment_id=?' % side.apps, (p['id'],)).fetchall()
         unapplied = p['ctrl_home'] - sum(a['home'] for a in apps)
-        seq = 100
+        seqs[ptid] = 100
         if unapplied:     # a prepayment stays a customer credit / vendor prepayment until applied
             net = -side.sign * unapplied
-            rows.append((next_id, ptid, seq, ctrl, max(net, 0), max(-net, 0), p['memo'], p[side.name_col], '', p['date']))
+            rows.append((next_id, ptid, 100, ctrl, max(net, 0), max(-net, 0), p['memo'], p[side.name_col], '', p['date']))
             next_id += 1
         for a in apps:
-            d, _ = docs_by_id[(side.doc, a[side.fk])]
-            src = [l for l in lines_by_txn.get(d['txn_id'], []) if l['account_id'] != ctrl]
-            if not d['total_home'] or not src:
-                continue
-            target = -side.sign * a['home']        # what these lines must add up to (debit - credit)
-            share = [int(round((l['debit'] - l['credit']) * a['home'] / float(d['total_home']))) for l in src]
-            if share:
-                big = max(range(len(src)), key=lambda i: abs(src[i]['debit'] - src[i]['credit']))
-                share[big] += target - sum(share)
+            per_doc.setdefault((side.doc, a[side.fk]), []).append((p['date'], p['id'], ptid, p, a, side))
+    for key, items_ in per_doc.items():
+        d, ctrl = docs_by_id[key]
+        src = [l for l in lines_by_txn.get(d['txn_id'], []) if l['account_id'] != ctrl]
+        if not d['total_home'] or not src:
+            continue
+        done = [0] * len(src)        # recognised so far, per line
+        paid = 0
+        big = max(range(len(src)), key=lambda i: abs(src[i]['debit'] - src[i]['credit']))
+        for pdate, pid, ptid, p, a, side in sorted(items_, key=lambda x: (x[0], x[1])):
+            paid += a['home']
+            # Each line is recognised in proportion to what has been paid so far, so a fully paid
+            # document ends up exactly at its own lines however many payments it took.
+            want = [int(round((l['debit'] - l['credit']) * paid / float(d['total_home']))) for l in src]
+            if paid == d['total_home']:
+                want = [l['debit'] - l['credit'] for l in src]
+            share = [w - x for w, x in zip(want, done)]
+            share[big] += -side.sign * a['home'] - sum(share)
+            done = [x + y for x, y in zip(done, share)]
             for l, net in zip(src, share):
                 if net:
-                    seq += 1
-                    rows.append((next_id, ptid, seq, l['account_id'], max(net, 0), max(-net, 0), l['memo'],
+                    seqs[ptid] += 1
+                    rows.append((next_id, ptid, seqs[ptid], l['account_id'], max(net, 0), max(-net, 0), l['memo'],
                                  l['name_id'], '', p['date']))
                     next_id += 1
     conn.executemany('INSERT INTO cl VALUES (?,?,?,?,?,?,?,?,?,?)', rows)
@@ -437,7 +453,8 @@ def trial_balance(ctx):
         if not v:
             continue
         sign = 1 if v > 0 else -1
-        drill = {'segments': [{'accounts': list(i), 'start': s, 'end': e, 'sign': sign} for i, s, e, _ in segs]}
+        drill = {'basis': b.basis,
+                 'segments': [{'accounts': list(i), 'start': s, 'end': e, 'sign': sign} for i, s, e, _ in segs]}
         rows.append({'label': a['full_name'], 'level': 0, 'kind': 'account', 'account_id': a['id'],
                      'values': [money(v) if v > 0 else None, money(-v) if v < 0 else None],
                      'drill': [drill if v > 0 else None, drill if v < 0 else None]})
@@ -814,7 +831,7 @@ def settings(ctx):
         db.set_setting(ctx.conn, 'company_name', name)
     if 'home_currency' in b:
         cur = str(b['home_currency'] or '').strip().upper()
-        if len(cur) != 3 or not cur.isalpha():
+        if not re.fullmatch(r'[A-Z]{3}', cur):
             raise ApiError(400, 'Home currency must be a 3-letter code such as USD')
         if cur != docs.home_currency(ctx.conn) and ctx.conn.execute('SELECT 1 FROM transactions LIMIT 1').fetchone():
             raise ApiError(400, 'The home currency can only be set before any transactions are entered')
