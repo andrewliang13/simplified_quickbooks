@@ -38,6 +38,14 @@ def _lines(conn, body):
     return out
 
 
+def _check_duplicate(conn, ref, body, self_id=0):
+    """Like QuickBooks' 'warn if duplicate journal number': refuse unless the user confirms."""
+    if body.get('allow_duplicate') in (True, 1, '1', 'true'):
+        return
+    if conn.execute("SELECT 1 FROM transactions WHERE type='Journal' AND ref=? AND id<>?", (ref, self_id)).fetchone():
+        raise ApiError(409, 'Journal no. %s is already used. Save anyway?' % ref)
+
+
 @route('GET', '/api/journals')
 def list_journals(ctx):
     sql = "SELECT t.id FROM transactions t WHERE t.type='Journal'"
@@ -59,6 +67,7 @@ def list_journals(ctx):
 def create_journal(ctx):
     b = ctx.body
     ref = as_str(b.get('ref'), 'ref') or ledger.next_ref(ctx.conn, 'Journal')
+    _check_duplicate(ctx.conn, ref, b)
     tid = ledger.post_txn(ctx.conn, b.get('date'), 'Journal', _lines(ctx.conn, b), ref=ref,
                           memo=as_str(b.get('memo'), 'memo'))
     return ledger.txn_json(ctx.conn, tid)
@@ -74,6 +83,7 @@ def update_journal(ctx):
     b = ctx.body
     ref = as_str(b.get('ref'), 'ref') or t['ref']
     memo = as_str(b['memo'], 'memo') if 'memo' in b else t['memo']
+    _check_duplicate(ctx.conn, ref, b, t['id'])
     ledger.post_txn(ctx.conn, b.get('date') or t['date'], 'Journal', _lines(ctx.conn, b), ref=ref,
                     memo=memo, txn_id=t['id'])
     return ledger.txn_json(ctx.conn, t['id'])

@@ -1,4 +1,6 @@
 """Bank and credit card reconciliation."""
+import json
+
 from . import ledger
 from .router import route
 from .util import ApiError, as_bool, as_int, as_list, money, parse_date, to_cents
@@ -84,7 +86,11 @@ def rec_json(conn, rec):
         'cleared_payments': money(cl_out), 'cleared_payment_count': sum(1 for l in cleared if l['credit'] > l['debit']),
         'lines': lines,
     }
-    if rec['status'] == 'done':
+    if rec['status'] == 'done' and rec['snapshot']:
+        # Like QuickBooks, the report shows the books as they were when the reconciliation was finished.
+        out.update(json.loads(rec['snapshot']))
+        out['snapshot'] = True
+    elif rec['status'] == 'done':
         unc = conn.execute(_LINE_SQL + "WHERE l.account_id=? AND t.date <= ? AND "
                            "(l.reconciliation_id IS NULL OR l.reconciliation_id > ?) ORDER BY t.date, l.id",
                            (acct['id'], rec['statement_date'], rec['id'])).fetchall()
@@ -133,6 +139,7 @@ def list_recs(ctx):
                             _sign(_account(ctx.conn, r['account_id'])['type']))),
                     'ending_balance': money(r['ending_balance']),
                     'completed_at': r['completed_at'],
+                    'opening_balance': bool(r['snapshot'] and '"opening_balance": true' in r['snapshot']),
                     'can_undo': r['status'] == 'open' or (last is not None and last['id'] == r['id'])})
     return out
 
@@ -239,7 +246,23 @@ def finish(ctx):
     conn.execute("UPDATE lines SET recon_status='R' WHERE reconciliation_id=?", (rec['id'],))
     conn.execute("UPDATE reconciliations SET status='done', beginning_balance=?, completed_at=CURRENT_TIMESTAMP "
                  'WHERE id=?', (round(j['beginning_balance'] * 100), rec['id']))
+    live = rec_json(conn, _rec(conn, rec['id']))
+    snap = {k: live[k] for k in ('uncleared', 'uncleared_total', 'register_balance')}
+    conn.execute('UPDATE reconciliations SET snapshot=? WHERE id=?', (json.dumps(snap), rec['id']))
     return rec_json(conn, _rec(conn, rec['id']))
+
+
+def reconcile_opening_balance(conn, account_id, line_id, date, amount_cents):
+    """QuickBooks treats the opening balance of a new bank or card account as already reconciled, so the
+    first statement starts from it. Recorded as a finished reconciliation that can be undone like any other."""
+    acct = _account(conn, account_id)
+    ending = _sign(acct['type']) * amount_cents
+    rid = conn.execute("INSERT INTO reconciliations(account_id, statement_date, beginning_balance, ending_balance, "
+                       "status, completed_at, snapshot) VALUES (?,?,0,?,'done',CURRENT_TIMESTAMP,?)",
+                       (account_id, date, ending, json.dumps({'uncleared': [], 'uncleared_total': 0.0,
+                                                              'register_balance': money(ending),
+                                                              'opening_balance': True}))).lastrowid
+    conn.execute("UPDATE lines SET recon_status='R', reconciliation_id=? WHERE id=?", (rid, line_id))
 
 
 @route('DELETE', '/api/reconciliations/<id>')

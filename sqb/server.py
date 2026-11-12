@@ -6,7 +6,12 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import db
+import base64
+import binascii
+import threading
+import webbrowser
+
+from . import backup, db
 from .router import ROUTES, Ctx
 from .util import ApiError
 # Importing the modules registers their routes.
@@ -22,6 +27,8 @@ class App:
 
     def handle(self, method, path, query=None, body=None):
         """Dispatch one API call. Returns (http_status, json_payload)."""
+        if path.startswith('/api/backups'):
+            return self._backups(method, path, body or {})
         matched_path = False
         for m, regex, fn in ROUTES:
             mo = regex.match(path)
@@ -48,6 +55,27 @@ class App:
             finally:
                 conn.close()
         return (405, {'error': 'Method not allowed'}) if matched_path else (404, {'error': 'Not found'})
+
+
+    def _backups(self, method, path, body):
+        try:
+            if method == 'GET' and path == '/api/backups':
+                return 200, backup.list_backups(self.db_path)
+            if method == 'POST' and path == '/api/backups':
+                return 200, {'file': os.path.basename(backup.make_backup(self.db_path))}
+            if method == 'POST' and path == '/api/backups/restore':
+                if body.get('file'):
+                    safety = backup.restore(self.db_path, backup_file=body['file'])
+                else:
+                    try:
+                        data = base64.b64decode(str(body.get('content_b64') or ''), validate=True)
+                    except (binascii.Error, ValueError):
+                        raise ApiError(400, 'That file is not a Simplified QuickBooks backup')
+                    safety = backup.restore(self.db_path, data=data)
+                return 200, {'restored': True, 'safety_backup': safety}
+            return 404, {'error': 'Not found'}
+        except ApiError as e:
+            return e.status, {'error': e.message}
 
 
 def make_handler(app):
@@ -85,6 +113,17 @@ def make_handler(app):
                 if method == 'GET':
                     return self._static(u.path)
                 return self._send(404, b'Not found', 'text/plain')
+            if u.path == '/api/backups/download' and method == 'GET':
+                data = backup.download_bytes(app.db_path)
+                name = '%s-%s.db' % (os.path.splitext(os.path.basename(app.db_path))[0],
+                                     __import__('datetime').date.today().isoformat())
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/octet-stream')
+                self.send_header('Content-Disposition', 'attachment; filename="%s"' % name)
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             query = {k: v[-1] for k, v in parse_qs(u.query).items()}
             body = {}
             n = int(self.headers.get('Content-Length') or 0)
@@ -113,10 +152,29 @@ def make_handler(app):
     return Handler
 
 
-def serve(db_path, host='127.0.0.1', port=8000):
+def serve(db_path, host='127.0.0.1', port=8000, open_browser=False):
+    existed = os.path.exists(db_path)
     app = App(db_path)
-    httpd = ThreadingHTTPServer((host, port), make_handler(app))
-    print('Simplified QuickBooks running at http://%s:%d  (data file: %s)' % (host, port, db_path))
+    if existed:
+        made = backup.auto_backup(db_path)
+        if made:
+            print('Daily backup saved: %s' % made)
+    httpd = None
+    for p in range(port, port + 20):          # step past a port that is already taken
+        try:
+            httpd = ThreadingHTTPServer((host, p), make_handler(app))
+            port = p
+            break
+        except OSError:
+            continue
+    if httpd is None:
+        raise SystemExit('No free port between %d and %d' % (port, port + 19))
+    url = 'http://%s:%d' % ('localhost' if host in ('127.0.0.1', '0.0.0.0') else host, port)
+    print('Simplified QuickBooks is running at %s' % url)
+    print('Company file: %s' % os.path.abspath(db_path))
+    print('Keep this window open while you work. Press Ctrl+C to stop.')
+    if open_browser:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

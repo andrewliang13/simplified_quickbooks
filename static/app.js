@@ -12,6 +12,7 @@ const money = c => fmt(c / 100);
 const amt = n => n == null ? '' : `<span class="${n < 0 ? 'neg' : ''}">${fmt(n)}</span>`;
 const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 const today = () => iso(new Date());
+const localTime = s => s ? new Date(s.replace(' ', 'T') + 'Z').toLocaleString() : '';
 
 const S = {accounts: [], customers: [], vendors: [], meta: {}};
 
@@ -81,7 +82,12 @@ async function render() {
   const main = $('#main');
   await run(async () => { await loadRefs(); await (pages[page] || pages.dashboard)(main, params); });
 }
-window.addEventListener('hashchange', render);
+window.addEventListener('hashchange', () => { $$('.modal-backdrop').forEach(x => x.remove()); render(); });
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  const all = $$('.modal-backdrop');
+  if (all.length) all[all.length - 1].remove();
+});
 window.addEventListener('DOMContentLoaded', () => {
   $('#settings-btn').onclick = settingsModal;
   render();
@@ -93,10 +99,37 @@ function settingsModal() {
     <label class="full">Company name<input id="s-name" value="${esc(S.meta.company_name)}"></label>
     <label class="full">First month of fiscal year<select id="s-fy">${months.map((x, i) =>
       `<option value="${i + 1}" ${S.meta.fiscal_year_start_month === i + 1 ? 'selected' : ''}>${x}</option>`).join('')}</select></label>
-    </div><div class="foot"><button data-close>Cancel</button><button class="primary" id="s-save">Save</button></div>`);
+    </div><div class="foot"><button data-close>Cancel</button><button class="primary" id="s-save">Save</button></div>
+    <h2>Backups</h2>
+    <p class="muted">A backup is saved automatically each day you open the app (last 30 kept in the <b>backups</b> folder next to your company file).</p>
+    <div class="bar"><a href="/api/backups/download"><button>Download a copy</button></a><button id="b-now">Back up now</button>
+      <label class="inline"><span class="btn" style="cursor:pointer">Restore from file&hellip;</span><input type="file" id="b-file" accept=".db" hidden></label></div>
+    <div id="b-list"></div>`);
   $('#s-save', m.el).onclick = () => run(async () => {
     await api('PUT', '/api/settings', {company_name: $('#s-name', m.el).value, fiscal_year_start_month: $('#s-fy', m.el).value});
     m.close(); toast('Saved'); render();
+  });
+  const restored = r => { m.close(); toast(`Restored. Your previous books were saved as ${r.safety_backup}`); render(); };
+  const sure = () => confirm('Replace ALL current books with this backup? Your current books are backed up first.');
+  const list = async () => {
+    const b = await api('GET', '/api/backups');
+    $('#b-list', m.el).innerHTML = b.length ? `<div class="tbl" style="max-height:220px"><table><thead><tr><th>Backup</th><th>Saved</th><th></th></tr></thead><tbody>
+      ${b.map(x => `<tr><td>${esc(x.file)}</td><td class="nowrap">${x.created}</td><td class="actions"><button class="small" data-restore="${esc(x.file)}">Restore</button></td></tr>`).join('')}</tbody></table></div>`
+      : '<div class="muted">No backups yet.</div>';
+  };
+  run(list);
+  $('#b-now', m.el).onclick = () => run(async () => { const r = await api('POST', '/api/backups'); toast('Saved ' + r.file); list(); });
+  $('#b-list', m.el).onclick = e => run(async () => {
+    const b = e.target.closest('[data-restore]');
+    if (b && sure()) restored(await api('POST', '/api/backups/restore', {file: b.dataset.restore}));
+  });
+  $('#b-file', m.el).onchange = e => run(async () => {
+    const f = e.target.files[0];
+    if (!f || !sure()) return;
+    const buf = new Uint8Array(await f.arrayBuffer());
+    let bin = '';
+    for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+    restored(await api('POST', '/api/backups/restore', {content_b64: btoa(bin)}));
   });
 }
 
@@ -272,7 +305,7 @@ async function rulesModal() {
   const draw = async () => {
     const rules = await api('GET', '/api/rules');
     $('#rules', m.el).innerHTML = rules.length ? `<div class="tbl"><table><thead><tr><th>Description contains</th><th>Money</th><th>Category</th><th>Customer / vendor</th><th></th></tr></thead>
-      <tbody>${rules.map(r => `<tr><td>${esc(r.match_text)}</td><td>${r.direction}</td><td>${esc(r.account)}</td><td>${esc(r.name || '')}</td>
+      <tbody>${rules.map(r => `<tr><td>${esc(r.match_text)}</td><td>${{any: 'In or out', in: 'Money in', out: 'Money out'}[r.direction]}</td><td>${esc(r.account)}</td><td>${esc(r.name || '')}</td>
       <td class="actions"><button class="small" data-edit="${r.id}">Edit</button><button class="small danger" data-del="${r.id}">Delete</button></td></tr>`).join('')}</tbody></table></div>`
       : '<div class="empty">No rules yet. Rules pre-fill the category for statement lines whose description contains your text.</div>';
     $('#rules', m.el).onclick = e => run(async () => {
@@ -498,7 +531,12 @@ async function journalModal(j) {
     const body = {date: $('#j-date', m.el).value, ref: $('#j-ref', m.el).value, memo: $('#j-memo', m.el).value,
       lines: $$('tbody tr', m.el).map(tr => ({account_id: $('.l-acct', tr).value || null, debit: $('.l-dr', tr).value, credit: $('.l-cr', tr).value,
         memo: $('.l-memo', tr).value, name_id: $('.l-name', tr).value || null}))};
-    await api(edit ? 'PUT' : 'POST', '/api/journals' + (edit ? '/' + j.id : ''), body);
+    try {
+      await api(edit ? 'PUT' : 'POST', '/api/journals' + (edit ? '/' + j.id : ''), body);
+    } catch (e) {
+      if (!/already used/.test(e.message) || !confirm(e.message)) throw e;
+      await api(edit ? 'PUT' : 'POST', '/api/journals' + (edit ? '/' + j.id : ''), Object.assign(body, {allow_duplicate: true}));
+    }
     m.close(); toast('Journal entry saved'); render();
   });
 }
@@ -688,7 +726,7 @@ pages.reconcile = async (main, params) => {
     <h2>History</h2>
     <div class="tbl"><table><thead><tr><th>Account</th><th>Statement date</th><th class="num">Beginning balance</th><th class="num">Ending balance</th><th>Status</th><th></th></tr></thead>
     <tbody>${hist.map(r => `<tr><td>${esc(r.account)}</td><td>${r.statement_date}</td><td class="num">${fmt(r.beginning_balance)}</td><td class="num">${fmt(r.ending_balance)}</td>
-      <td><span class="badge ${r.status}">${r.status === 'done' ? 'Reconciled' : 'In progress'}</span></td>
+      <td><span class="badge ${r.status}">${r.status === 'done' ? 'Reconciled' : 'In progress'}</span>${r.opening_balance ? ' <span class="muted">opening balance</span>' : ''}</td>
       <td class="actions">${r.status === 'done' ? `<button class="small" data-report="${r.id}">Report</button>` : `<a href="#reconcile?id=${r.id}">Resume</a>`}
       ${r.can_undo ? `<button class="small danger" data-undo="${r.id}">${r.status === 'done' ? 'Undo' : 'Cancel'}</button>` : ''}</td></tr>`).join('') ||
       '<tr><td colspan="6" class="empty">No reconciliations yet.</td></tr>'}</tbody></table></div>`;
@@ -759,6 +797,8 @@ async function recReport(id) {
     ${rows.map(l => `<tr class="click" data-txn="${l.txn_id}"><td>${l.date}</td><td>${esc(l.type)}</td><td>${esc(l.ref)}</td><td>${esc(l.name || l.memo || '')}</td><td class="num">${amt(l.amount)}</td></tr>`).join('')}
     </tbody></table></div>` : '<div class="muted">None</div>';
   const m = modal(`Reconciliation report: ${r.account}, statement ending ${r.statement_date}`, `
+    ${r.opening_balance ? '<div class="note">Opening balance entered when the account was created. It counts as reconciled, so the first statement starts from it.</div>' : ''}
+    ${r.snapshot ? `<p class="muted">As of when it was reconciled (${esc(localTime(r.completed_at))}). Later changes are not included.</p>` : ''}
     <div class="tbl"><table><tbody>
       <tr><td>Statement beginning balance</td><td class="num">${fmt(r.beginning_balance)}</td></tr>
       <tr><td>${cc ? 'Charges' : 'Checks and payments'} cleared (${r.cleared_payment_count})</td><td class="num">${fmt(cc ? r.cleared_payments : -r.cleared_payments)}</td></tr>

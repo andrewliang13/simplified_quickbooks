@@ -435,5 +435,40 @@ class Reports(ApiCase):
         self.assertEqual(self.val(bs, 'Retained Earnings'), 0.0)
 
 
+class Backups(ApiCase):
+    def test_backup_and_restore(self):
+        import base64
+        from sqb import backup
+        self.post('/api/customers', {'name': 'Before'})
+        made = self.post('/api/backups')['file']
+        self.post('/api/customers', {'name': 'After'})
+        self.assertEqual(len(self.get('/api/customers')), 2)
+        r = self.post('/api/backups/restore', {'file': made})
+        self.assertEqual([c['name'] for c in self.get('/api/customers')], ['Before'])
+        self.assertIn('before-restore', r['safety_backup'])        # current books were kept
+        # restore from an uploaded copy
+        data = backup.download_bytes(self.db_path)
+        self.post('/api/customers', {'name': 'Later'})
+        self.post('/api/backups/restore', {'content_b64': base64.b64encode(data).decode()})
+        self.assertEqual([c['name'] for c in self.get('/api/customers')], ['Before'])
+        # junk and path tricks are refused, books untouched
+        self.post('/api/backups/restore', {'content_b64': base64.b64encode(b'not a db').decode()}, expect=400)
+        self.post('/api/backups/restore', {'file': '../' + made}, expect=404)
+        self.assertEqual(len(self.get('/api/customers')), 1)
+
+    def test_auto_backup_once_a_day(self):
+        from sqb import backup
+        self.assertIsNotNone(backup.auto_backup(self.db_path))
+        self.assertIsNone(backup.auto_backup(self.db_path))
+        self.assertEqual(len([b for b in self.get('/api/backups') if b['file'].endswith('-auto.db')]), 1)
+
+    def tearDown(self):
+        import glob, os
+        from sqb import backup
+        for f in glob.glob(os.path.join(backup.backup_dir(self.db_path), os.path.basename(self.db_path)[:-3] + '-*.db')):
+            os.remove(f)
+        super().tearDown()
+
+
 if __name__ == '__main__':
     unittest.main()

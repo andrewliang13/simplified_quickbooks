@@ -12,5 +12,6 @@ if __name__ == '__main__':
     ap.add_argument('--host', default='127.0.0.1')
     ap.add_argument('--db', default=os.environ.get('SQB_DB', os.path.join(here, 'books.db')),
                     help='path of the company data file (SQLite)')
+    ap.add_argument('--no-browser', action='store_true', help='do not open a browser window')
     args = ap.parse_args()
-    serve(args.db, args.host, args.port)
+    serve(args.db, args.host, args.port, open_browser=not args.no_browser)

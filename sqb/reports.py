@@ -76,8 +76,17 @@ def make_cols(start, end, columns, compare, m0, point=False):
                          'start': cs, 'end': ce})
             cols.append({'kind': 'change', 'label': 'Change', 'base': base, 'cmp': base + 1})
             cols.append({'kind': 'pct', 'label': '% Change', 'base': base, 'cmp': base + 1})
-    if len(ps) > 1 and not point and compare not in ('pp', 'py'):
+    if len(ps) > 1 and not point:
+        base = len(cols)
         cols.append({'kind': 'amount', 'label': 'Total', 'start': start, 'end': end})
+        if compare in ('pp', 'py'):
+            # Comparison total covers the same periods as the comparison columns.
+            cmp_cols = [c for c in cols[:base] if c['label'].endswith((' (PP)', ' (PY)'))]
+            cs, ce = cmp_cols[0]['start'], cmp_cols[-1]['end']
+            cols.append({'kind': 'amount', 'label': 'Total' + (' (PP)' if compare == 'pp' else ' (PY)'),
+                         'start': cs, 'end': ce})
+            cols.append({'kind': 'change', 'label': 'Change', 'base': base, 'cmp': base + 1})
+            cols.append({'kind': 'pct', 'label': '% Change', 'base': base, 'cmp': base + 1})
     return cols
 
 

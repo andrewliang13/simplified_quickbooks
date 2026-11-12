@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS reconciliations(
   beginning_balance INTEGER NOT NULL DEFAULT 0,
   ending_balance INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'open',   -- open | done
+  snapshot TEXT,                         -- JSON of the report at the moment it was finished
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   completed_at TEXT
 );
@@ -192,6 +193,8 @@ def init(path):
         conn.executescript(SCHEMA)
         if 'fitid' not in [r[1] for r in conn.execute('PRAGMA table_info(feed)')]:
             conn.execute('ALTER TABLE feed ADD COLUMN fitid TEXT')
+        if 'snapshot' not in [r[1] for r in conn.execute('PRAGMA table_info(reconciliations)')]:
+            conn.execute('ALTER TABLE reconciliations ADD COLUMN snapshot TEXT')
         if conn.execute('SELECT COUNT(*) FROM accounts').fetchone()[0] == 0:
             conn.executemany(
                 'INSERT INTO accounts(number, name, type, system) VALUES (?,?,?,?)', DEFAULT_ACCOUNTS)

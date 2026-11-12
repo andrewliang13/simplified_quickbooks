@@ -164,10 +164,14 @@ def create_account(ctx):
         obe = db.system_account(ctx.conn, 'obe')
         date = parse_date(ctx.body.get('opening_date') or today(), 'opening_date')
         amt = ob * normal_sign(v['type'])   # + means debit the new account
-        ledger.post_txn(ctx.conn, date, 'Journal', [
+        tid = ledger.post_txn(ctx.conn, date, 'Journal', [
             {'account_id': aid, 'debit': amt, 'memo': 'Opening Balance'},
             {'account_id': obe, 'credit': amt, 'memo': 'Opening Balance'},
         ], ref=ledger.next_ref(ctx.conn, 'Journal'), memo='Opening Balance')
+        if v['type'] in ('Bank', 'Credit Card'):
+            from . import reconcile
+            line = ctx.conn.execute('SELECT id FROM lines WHERE txn_id=? AND account_id=?', (tid, aid)).fetchone()
+            reconcile.reconcile_opening_balance(ctx.conn, aid, line['id'], date, amt)
     ctx.p['id'] = aid
     return get_account(ctx)
 

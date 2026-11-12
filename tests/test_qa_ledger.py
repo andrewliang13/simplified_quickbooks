@@ -190,7 +190,11 @@ class AccountsOpeningBalance(QaCase):
         a = self.post('/api/accounts', {'name': 'Tmp', 'type': 'Bank', 'opening_balance': 10,
                                         'opening_date': '2026-01-01'})
         self.delete('/api/accounts/%d' % a['id'], expect=409)
-        self.delete('/api/transactions/%d' % self.get('/api/journals')[0]['id'])
+        jid = self.get('/api/journals')[0]['id']
+        self.delete('/api/transactions/%d' % jid, expect=409)       # opening balance starts reconciled
+        rec = self.get('/api/reconciliations', account_id=a['id'])[0]
+        self.delete('/api/reconciliations/%d' % rec['id'])         # undo it first, as in QuickBooks
+        self.delete('/api/transactions/%d' % jid)
         self.delete('/api/accounts/%d' % a['id'])
 
     def test_gap_opening_balance_on_new_ar_ap_account_is_not_tied_to_a_name(self):
@@ -797,7 +801,6 @@ class JournalNumbering(QaCase):
         self.assertNo500('POST', '/api/accounts', {'name': 'MM', 'type': 'Bank', 'opening_balance': 5},
                          allowed=(200,))
 
-    @unittest.expectedFailure
     def test_gap_duplicate_journal_number_is_accepted_silently(self):
         """GAP: two journals can share the same ref with no warning. QuickBooks (with 'warn on duplicate
         journal number', and always for auto-numbering) flags this."""

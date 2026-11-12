@@ -706,7 +706,6 @@ class Report(RecCase):
         self.journal('2026-03-01', ('Rent and Lease', 5, 0), ('Checking', 0, 5))
         self.assertEqual(self.rec(jan['id']), before)
 
-    @unittest.expectedFailure
     def test_report_is_a_snapshot(self):
         """GAP: the QuickBooks reconciliation report is frozen at the time of reconciling ("changes made after
         this date aren't included"). Here register_balance / uncleared are recomputed live, so a transaction
@@ -809,8 +808,8 @@ class OpeningBalance(RecCase):
                                         'opening_date': '2025-12-31'})
         self.journal('2026-01-10', ('Bank Charges and Fees', 12, 0), ('Money Market', 0, 12))
         rec = self.start(a['id'], '2026-01-31', 4988)
-        # the opening balance is an ordinary item to check off in the first reconciliation
-        self.assertEqual((rec['beginning_balance'], [l['amount'] for l in rec['lines']]), (0, [5000.0, -12.0]))
+        # like QuickBooks, the opening balance is already reconciled and is the first beginning balance
+        self.assertEqual((rec['beginning_balance'], [l['amount'] for l in rec['lines']]), (5000.0, [-12.0]))
         done = self.clear_all_and_finish(rec)
         self.assertEqual((done['cleared_balance'], done['register_balance']), (4988.0, 4988.0))
         self.assertEqual(self.recon_acct(a['id'])['beginning_balance'], 4988.0)
@@ -820,11 +819,10 @@ class OpeningBalance(RecCase):
                                         'opening_date': '2025-12-31'})
         self.assertEqual(a['balance'], 750.0)
         rec = self.start(a['id'], '2026-01-31', 750)
-        self.assertEqual([(l['payment'], l['amount']) for l in rec['lines']], [(750.0, 750.0)])
+        self.assertEqual((rec['beginning_balance'], rec['lines'], rec['difference']), (750.0, [], 0))
         done = self.clear_all_and_finish(rec)
         self.assertEqual(done['cleared_balance'], 750.0)
 
-    @unittest.expectedFailure
     def test_first_beginning_balance_is_opening_balance(self):
         """GAP: in QuickBooks Online the opening balance entered when the account is created is the beginning
         balance of the first reconciliation (the entry is already marked R). Here the first beginning balance

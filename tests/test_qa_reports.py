@@ -575,7 +575,6 @@ class Comparison(Books):
                                   ('2024-03-01', '2024-03-31'), ('2023-03-01', '2023-03-31')])
         self.check_cells(rep, 'pl month+py')
 
-    @unittest.expectedFailure   # known gap: no Total column when period columns are combined with a comparison
     def test_gap_columns_with_compare_has_total(self):
         # QuickBooks keeps the Total column when comparison columns are added to a trended report.
         rep = self.rep('profit_loss', start='2024-01-01', end='2024-03-31', columns='month', compare='py')
