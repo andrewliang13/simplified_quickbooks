@@ -1,0 +1,7 @@
+books.db*
+*.db
+*.db-*
+__pycache__/
+*.pyc
+.DS_Store
+.claude/
